@@ -19,9 +19,18 @@ class Settings(BaseSettings):
     rate_limit_enabled: bool = True
     rate_limit_hourly_default: int = 1000
     stripe_webhook_secret: Optional[str] = None
+    
+    # Database settings
+    postgres_user: str = "postgres"
+    postgres_password: str = "postgres"
+    postgres_db: str = "tce"
+    postgres_host: str = "localhost"
+    postgres_port: str = "5432"
+    database_url: Optional[str] = None
 
     class Config:
         env_file = ".env"
+        extra = "ignore"
 
 
 settings = Settings()
