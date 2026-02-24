@@ -52,29 +52,19 @@ async def callback_google(code: str, error: Optional[str] = None):
     
     tokens = response.json()
     id_token = tokens.get("id_token")
-    access_token = tokens.get("access_token")
+    # access_token = tokens.get("access_token")
     
-    # Get user info
-    user_info_response = requests.get(
-        "https://www.googleapis.com/oauth2/v3/userinfo",
-        headers={"Authorization": f"Bearer {access_token}"}
-    )
+    # In a real app, you would:
+    # 1. Verify the id_token
+    # 2. Check if user exists in DB or create one
+    # 3. Generate your own JWT access token
     
-    if user_info_response.status_code != 200:
-        raise HTTPException(status_code=400, detail="Failed to get user info from Google")
-        
-    user_info = user_info_response.json()
+    # For now, we will redirect to the frontend with the Google ID token
+    # The frontend can then use this token to authenticate or we can assume this IS the token.
+    # We are using the id_token as it is the most useful for identity assertion.
     
-    # Here you would typically:
-    # 1. Check if user exists in your DB by email
-    # 2. If not, create a new user
-    # 3. Create a session/JWT for your app
-    
-    # For now, we'll just return the user info and tokens
-    return ok({
-        "user": user_info,
-        "tokens": tokens
-    })
+    redirect_url = f"https://veritariffai.co?token={id_token}"
+    return RedirectResponse(url=redirect_url)
 
 @router.post("/google")
 async def auth_google(payload: GoogleAuthRequest):
