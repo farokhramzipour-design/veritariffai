@@ -7,6 +7,7 @@ from app.api.v1.subscriptions.router import router as subs_router
 from app.api.v1.tariff.router import router as tariff_router
 from app.api.v1.internal.router import router as internal_router
 from app.api.v1.webhooks.router import router as webhooks_router
+from app.api.v1.duty_rate.router import router as duty_rate_router
 
 
 api_router = APIRouter()
@@ -18,3 +19,4 @@ api_router.include_router(subs_router, prefix="/subscriptions", tags=["subscript
 api_router.include_router(tariff_router, prefix="/tariff", tags=["tariff"])
 api_router.include_router(internal_router, prefix="/internal", tags=["internal"])
 api_router.include_router(webhooks_router, prefix="/webhooks", tags=["webhooks"])
+api_router.include_router(duty_rate_router, tags=["duty-rate"])
