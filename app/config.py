@@ -28,6 +28,11 @@ class Settings(BaseSettings):
     postgres_port: str = "5432"
     database_url: Optional[str] = None
 
+    # Google Auth
+    google_client_id: Optional[str] = None
+    google_client_secret: Optional[str] = None
+    google_redirect_uri: Optional[str] = None
+
     class Config:
         env_file = ".env"
         extra = "ignore"
