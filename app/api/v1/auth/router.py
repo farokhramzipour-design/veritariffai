@@ -10,7 +10,6 @@ from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
 from app.core.jwt import create_jwt
 import time
-import jwt
 
 router = APIRouter()
 
