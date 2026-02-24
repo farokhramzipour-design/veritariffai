@@ -6,6 +6,8 @@ from app.core.responses import ok
 from app.config import settings
 import requests
 from typing import Optional
+from google.oauth2 import id_token
+from google.auth.transport import requests as google_requests
 
 router = APIRouter()
 
@@ -51,25 +53,56 @@ async def callback_google(code: str, error: Optional[str] = None):
         raise HTTPException(status_code=400, detail="Failed to retrieve token from Google")
     
     tokens = response.json()
-    id_token = tokens.get("id_token")
-    # access_token = tokens.get("access_token")
+    id_token_str = tokens.get("id_token")
     
-    # In a real app, you would:
-    # 1. Verify the id_token
-    # 2. Check if user exists in DB or create one
-    # 3. Generate your own JWT access token
-    
-    # For now, we will redirect to the frontend with the Google ID token
-    # The frontend can then use this token to authenticate or we can assume this IS the token.
-    # We are using the id_token as it is the most useful for identity assertion.
-    
-    redirect_url = f"https://veritariffai.co?token={id_token}"
+    # Redirect to frontend with the ID token
+    redirect_url = f"https://veritariffai.co?token={id_token_str}"
     return RedirectResponse(url=redirect_url)
 
 @router.post("/google")
 async def auth_google(payload: GoogleAuthRequest):
-    # This endpoint might be used if the frontend handles the OAuth flow and sends the ID token
-    return ok({"access_token": "jwt_string", "token_type": "bearer", "expires_in": 3600, "user": {"id": "uuid", "email": "user@example.com", "display_name": "Jane Smith", "plan": "free"}})
+    """
+    Verifies the Google ID token sent by the frontend, creates/retrieves the user,
+    and returns an application-specific access token (JWT).
+    """
+    try:
+        # Verify the token
+        id_info = id_token.verify_oauth2_token(
+            payload.id_token, 
+            google_requests.Request(), 
+            settings.google_client_id
+        )
+
+        # ID token is valid. Get the user's Google Account ID from the decoded token.
+        google_user_id = id_info['sub']
+        email = id_info.get('email')
+        name = id_info.get('name')
+        picture = id_info.get('picture')
+
+        # TODO: Implement User Logic
+        # 1. Check if user exists in DB by email or google_user_id
+        # 2. If not, create a new user record
+        # 3. Generate a JWT for YOUR application (not the Google one)
+        
+        # Mock response for now
+        return ok({
+            "access_token": "mock_app_jwt_token", 
+            "token_type": "bearer", 
+            "expires_in": 3600, 
+            "user": {
+                "id": "user_uuid", 
+                "email": email, 
+                "display_name": name, 
+                "picture": picture,
+                "plan": "free"
+            }
+        })
+
+    except ValueError as e:
+        # Invalid token
+        raise HTTPException(status_code=401, detail=f"Invalid Google token: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Authentication failed: {str(e)}")
 
 
 @router.post("/refresh")
