@@ -33,6 +33,10 @@ class Settings(BaseSettings):
     google_client_secret: Optional[str] = None
     google_redirect_uri: Optional[str] = None
 
+    # OpenAI
+    openai_api_key: Optional[str] = None
+    openai_model: str = "gpt-4"
+
     class Config:
         env_file = ".env"
         extra = "ignore"
