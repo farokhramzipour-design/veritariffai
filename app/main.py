@@ -18,7 +18,7 @@ def create_app() -> FastAPI:
             allow_methods=["*"],
             allow_headers=["*"],
         )
-    app.add_middleware(RateLimitMiddleware)
+    # app.add_middleware(RateLimitMiddleware)
     app.include_router(api_router, prefix=settings.api_prefix)
     app.add_exception_handler(APIError, api_error_handler)
     app.add_exception_handler(PlanUpgradeRequired, plan_upgrade_handler)

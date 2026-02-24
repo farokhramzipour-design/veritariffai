@@ -4,6 +4,7 @@ from fastapi import Request
 from starlette.middleware.base import BaseHTTPMiddleware
 from app.core.ratelimit import rate_limiter
 from app.config import settings
+from starlette.responses import Response
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
@@ -15,10 +16,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         limit = settings.rate_limit_hourly_default
         allowed = rate_limiter.allow(user_id, endpoint_group, limit)
         if not allowed:
-            from starlette.responses import Response
-
             resp = Response(content="Too Many Requests", status_code=429)
             resp.headers["Retry-After"] = "3600"
             return resp
         return await call_next(request)
-

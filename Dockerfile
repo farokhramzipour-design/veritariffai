@@ -9,11 +9,15 @@ ENV PYTHONUNBUFFERED=1
 WORKDIR /app
 
 # Install system dependencies
+# We try to avoid build-essential to save space.
+# psycopg[binary] should include necessary binaries.
+# If you strictly need libpq-dev for some reason, we can add it back,
+# but for now we try to keep it slim to avoid disk space issues.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    libpq-dev \
-    gcc \
-    && rm -rf /var/lib/apt/lists/*
+    libpq5 \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -rf /var/cache/apt/archives/*
 
 # Install python dependencies
 COPY requirements.txt .
