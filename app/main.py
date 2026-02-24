@@ -10,14 +10,19 @@ from app.core.middleware import RateLimitMiddleware
 
 def create_app() -> FastAPI:
     app = FastAPI(title=settings.app_name, version="0.1.0")
-    if settings.cors_origins:
-        app.add_middleware(
-            CORSMiddleware,
-            allow_origins=settings.cors_origins,
-            allow_credentials=True,
-            allow_methods=["*"],
-            allow_headers=["*"],
-        )
+    
+    # Configure CORS
+    # If cors_origins is empty, default to allowing all origins for development convenience
+    origins = settings.cors_origins if settings.cors_origins else ["*"]
+    
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
     # app.add_middleware(RateLimitMiddleware)
     app.include_router(api_router, prefix=settings.api_prefix)
     app.add_exception_handler(APIError, api_error_handler)
