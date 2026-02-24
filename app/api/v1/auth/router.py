@@ -8,6 +8,8 @@ import requests
 from typing import Optional
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
+from app.core.jwt import create_jwt
+import time
 
 router = APIRouter()
 
@@ -82,15 +84,30 @@ async def auth_google(payload: GoogleAuthRequest):
         # TODO: Implement User Logic
         # 1. Check if user exists in DB by email or google_user_id
         # 2. If not, create a new user record
-        # 3. Generate a JWT for YOUR application (not the Google one)
         
-        # Mock response for now
+        # 3. Generate a JWT for YOUR application (not the Google one)
+        # We need to generate a token that our own verify_jwt function can understand (HS256)
+        
+        now = int(time.time())
+        token_payload = {
+            "sub": google_user_id, # Or your internal user ID
+            "email": email,
+            "name": name,
+            "plan": "FREE", # Default plan
+            "iat": now,
+            "exp": now + 3600 * 24, # 24 hours
+            "iss": settings.jwt_issuer,
+            "aud": settings.jwt_audience
+        }
+        
+        access_token = create_jwt(token_payload)
+        
         return ok({
-            "access_token": "mock_app_jwt_token", 
+            "access_token": access_token, 
             "token_type": "bearer", 
-            "expires_in": 3600, 
+            "expires_in": 3600 * 24, 
             "user": {
-                "id": "user_uuid", 
+                "id": google_user_id,
                 "email": email, 
                 "display_name": name, 
                 "picture": picture,
