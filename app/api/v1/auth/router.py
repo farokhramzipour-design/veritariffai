@@ -10,6 +10,7 @@ from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
 from app.core.jwt import create_jwt
 import time
+import jwt
 
 router = APIRouter()
 
@@ -57,9 +58,44 @@ async def callback_google(code: str, error: Optional[str] = None):
     tokens = response.json()
     id_token_str = tokens.get("id_token")
     
-    # Redirect to frontend with the ID token
-    redirect_url = f"https://veritariffai.co?token={id_token_str}"
-    return RedirectResponse(url=redirect_url)
+    # Decode the ID token to get user info (without verification for now, as we trust the direct response from Google)
+    # In a production environment, you should verify the signature, but since we just got it from Google via HTTPS, it's reasonably safe for extraction.
+    # However, to be strictly correct, we should verify it.
+    
+    try:
+        # We use the google library to verify and decode
+        id_info = id_token.verify_oauth2_token(
+            id_token_str, 
+            google_requests.Request(), 
+            settings.google_client_id
+        )
+        
+        google_user_id = id_info['sub']
+        email = id_info.get('email')
+        name = id_info.get('name')
+        
+        # Generate OUR application JWT
+        now = int(time.time())
+        token_payload = {
+            "sub": google_user_id, # Or your internal user ID
+            "email": email,
+            "name": name,
+            "plan": "FREE", # Default plan
+            "iat": now,
+            "exp": now + 3600 * 24, # 24 hours
+            "iss": settings.jwt_issuer,
+            "aud": settings.jwt_audience
+        }
+        
+        app_access_token = create_jwt(token_payload)
+        
+        # Redirect to frontend with OUR application token
+        redirect_url = f"https://veritariffai.co?token={app_access_token}"
+        return RedirectResponse(url=redirect_url)
+        
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid Google token: {str(e)}")
+
 
 @router.post("/google")
 async def auth_google(payload: GoogleAuthRequest):
