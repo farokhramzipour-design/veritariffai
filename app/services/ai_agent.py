@@ -1,10 +1,56 @@
-import openapi
 import json
+import os
 import re
 from typing import Optional
+from app.config import settings
+
+try:
+    import openapi as openapi_pkg  # type: ignore
+except Exception:  # pragma: no cover
+    openapi_pkg = None  # type: ignore
+
+try:
+    from openai import OpenAI  # type: ignore
+except Exception:  # pragma: no cover
+    OpenAI = None  # type: ignore
 
 
-client = openapi.openapi()
+def _get_model_name() -> str:
+    return getattr(settings, "openai_model", None) or os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
+
+
+def _ensure_openai_key_from_openapi_env():
+    if not os.getenv("OPENAI_API_KEY") and os.getenv("openapi_API_KEY"):
+        os.environ["OPENAI_API_KEY"] = os.getenv("openapi_API_KEY") or ""
+
+
+def _run_chat(system_prompt: str, user_content: str) -> str:
+    _ensure_openai_key_from_openapi_env()
+    model = _get_model_name()
+    if openapi_pkg and hasattr(openapi_pkg, "openapi"):
+        client = openapi_pkg.openapi()  # type: ignore[attr-defined]
+        message = client.messages.create(
+            model=model,
+            max_tokens=512,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_content}],
+        )
+        raw = message.content[0].text.strip()
+        return raw
+    if OpenAI is None:
+        raise RuntimeError("No AI client available: install 'openapi' SDK or 'openai'.")
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ],
+        temperature=0.1,
+        max_tokens=512,
+    )
+    return resp.choices[0].message.content.strip()  # type: ignore
+
 
 AUTOFILL_SYSTEM_PROMPT = """
 You are a customs and trade expert. A user has typed a free-text description
@@ -43,15 +89,10 @@ Response format (JSON only):
 
 
 def parse_nl_description(description: str) -> dict:
-    message = client.messages.create(
-        model="openai-sonnet-4-6",
-        max_tokens=512,
-        system=AUTOFILL_SYSTEM_PROMPT,
-        messages=[
-            {"role": "user", "content": f"Parse this shipment description:\n\n{description}"}
-        ],
+    raw = _run_chat(
+        AUTOFILL_SYSTEM_PROMPT,
+        f"Parse this shipment description:\n\n{description}",
     )
-    raw = message.content[0].text.strip()
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
     return json.loads(raw)
@@ -94,14 +135,7 @@ def classify_hs_code(product_description: str, origin_country: Optional[str] = N
     user_content = f"Product: {product_description}"
     if origin_country:
         user_content += f"\nOrigin country: {origin_country}"
-    message = client.messages.create(
-        model="openai-sonnet-4-6",
-        max_tokens=512,
-        system=HS_LOOKUP_SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": user_content}],
-    )
-    raw = message.content[0].text.strip()
+    raw = _run_chat(HS_LOOKUP_SYSTEM_PROMPT, user_content)
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
     return json.loads(raw)
-
