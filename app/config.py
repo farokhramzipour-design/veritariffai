@@ -36,6 +36,10 @@ class Settings(BaseSettings):
     # OpenAI
     openai_api_key: Optional[str] = None
     openai_model: str = "gpt-4"
+    
+    # External Tariff APIs
+    hmrc_api_key: Optional[str] = None
+    taric_api_key: Optional[str] = None
 
     class Config:
         env_file = ".env"
