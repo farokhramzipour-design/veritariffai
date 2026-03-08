@@ -10,12 +10,13 @@ from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
 from app.core.jwt import create_jwt
 import time
-from fastapi import Response
+import jwt as pyjwt
 
 router = APIRouter()
 
 class GoogleAuthRequest(BaseModel):
     id_token: str
+    role: Optional[str] = None
 
 @router.get("/google/login")
 async def login_google():
@@ -130,6 +131,7 @@ async def auth_google(payload: GoogleAuthRequest):
             "email": email,
             "name": name,
             "plan": "FREE", # Default plan
+            "role": payload.role or "researcher",
             "iat": now,
             "exp": now + 3600 * 24, # 24 hours
             "iss": settings.jwt_issuer,
@@ -158,6 +160,83 @@ async def auth_google(payload: GoogleAuthRequest):
         raise HTTPException(status_code=500, detail=f"Authentication failed: {str(e)}")
 
 
+class MicrosoftAuthRequest(BaseModel):
+    id_token: str
+    role: Optional[str] = None
+
+
+@router.post("/microsoft")
+async def auth_microsoft(payload: MicrosoftAuthRequest):
+    try:
+        decoded = pyjwt.decode(payload.id_token, options={"verify_signature": False, "verify_aud": False})
+        sub = str(decoded.get("sub") or decoded.get("oid") or decoded.get("tid") or "microsoft-user")
+        email = decoded.get("email") or decoded.get("upn")
+        name = decoded.get("name") or decoded.get("preferred_username") or email or sub
+        now = int(time.time())
+        token_payload = {
+            "sub": f"ms:{sub}",
+            "email": email or f"{sub}@example.com",
+            "name": name,
+            "plan": "FREE",
+            "role": payload.role or "researcher",
+            "iat": now,
+            "exp": now + 3600 * 24,
+            "iss": settings.jwt_issuer,
+            "aud": settings.jwt_audience,
+        }
+        access_token = create_jwt(token_payload)
+        return ok({
+            "access_token": access_token,
+            "token_type": "bearer",
+            "expires_in": 3600 * 24,
+            "user": {
+                "id": token_payload["sub"],
+                "email": token_payload["email"],
+                "display_name": token_payload["name"],
+                "plan": "free",
+                "role": token_payload["role"],
+            },
+        })
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Authentication failed: {str(e)}")
+
+
+class AcademicMockRequest(BaseModel):
+    email: str
+    name: Optional[str] = None
+    role: Optional[str] = None
+
+
+@router.post("/academic/mock")
+async def auth_academic_mock(payload: AcademicMockRequest):
+    if not settings.academic_mock_enabled:
+        raise HTTPException(status_code=403, detail="Academic auth disabled")
+    now = int(time.time())
+    token_payload = {
+        "sub": f"ac:{payload.email}",
+        "email": payload.email,
+        "name": payload.name or payload.email,
+        "plan": "FREE",
+        "role": payload.role or "researcher",
+        "iat": now,
+        "exp": now + 3600 * 24,
+        "iss": settings.jwt_issuer,
+        "aud": settings.jwt_audience,
+    }
+    access_token = create_jwt(token_payload)
+    return ok({
+        "access_token": access_token,
+        "token_type": "bearer",
+        "expires_in": 3600 * 24,
+        "user": {
+            "id": token_payload["sub"],
+            "email": token_payload["email"],
+            "display_name": token_payload["name"],
+            "plan": "free",
+            "role": token_payload["role"],
+        },
+    })
+
 @router.post("/refresh")
 async def refresh():
     return ok({"access_token": "jwt_string", "token_type": "bearer", "expires_in": 3600})
@@ -166,26 +245,3 @@ async def refresh():
 @router.delete("/session")
 async def logout():
     return ok({"success": True})
-
-
-@router.get("/microsoft/login")
-async def login_microsoft():
-    raise HTTPException(status_code=501, detail="Microsoft login not implemented")
-
-
-@router.get("/academic/mock")
-async def academic_mock():
-    now = int(time.time())
-    token_payload = {
-        "sub": "academic-mock-user",
-        "email": "researcher@example.edu",
-        "name": "Academic Researcher",
-        "plan": "FREE",
-        "iat": now,
-        "exp": now + 3600 * 24,
-        "iss": settings.jwt_issuer,
-        "aud": settings.jwt_audience,
-        "role": "researcher"
-    }
-    app_access_token = create_jwt(token_payload)
-    return ok({"access_token": app_access_token, "token_type": "bearer", "user": {"email": "researcher@example.edu", "plan": "free", "role": "researcher"}})

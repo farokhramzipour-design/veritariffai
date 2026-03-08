@@ -40,10 +40,11 @@ class Settings(BaseSettings):
     # External Tariff APIs
     hmrc_api_key: Optional[str] = None
     taric_api_key: Optional[str] = None
-    companies_house_api_key: Optional[str] = None
-    companies_house_base_url: str = "https://api.company-information.service.gov.uk"
-    vies_wsdl_url: Optional[str] = None
     hmrc_eori_base_url: Optional[str] = None
+    companies_house_api_key: Optional[str] = None
+    vies_wsdl_url: Optional[str] = None
+    azure_ad_client_id: Optional[str] = None
+    academic_mock_enabled: bool = True
 
     class Config:
         env_file = ".env"

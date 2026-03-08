@@ -5,7 +5,7 @@
 > 1. `POST /api/autofill` — parses the NL textarea and returns all field values
 > 2. `POST /api/hs-lookup` — classifies a product description into an 8-digit HS code with confidence score
 >
-> **Stack:** FastAPI · Python 3.11 · Anthropic SDK · Redis · Pydantic v2
+> **Stack:** FastAPI · Python 3.11 · openapi SDK · Redis · Pydantic v2
 
 ---
 
@@ -108,21 +108,21 @@ class HSLookupResponse(BaseModel):
     chapter_description: str                     # e.g. "Footwear, gaiters and the like"
     alternatives: list[HSAlternative] = []       # up to 3 alternatives
     cached: bool = False                         # true if served from Redis
-    source: str = "claude"                       # "claude" | "fpo_api" | "cache"
+    source: str = "openai"                       # "openai" | "fpo_api" | "cache"
 ```
 
 ---
 
 ## File 2 — `services/ai_agent.py`
-### Claude API wrapper — two functions
+### openai API wrapper — two functions
 
 ```python
-import anthropic
+import openapi
 import json
 import re
 from typing import Optional
 
-client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from env automatically
+client = openapi.openapi()  # reads openapi_API_KEY from env automatically
 
 # ── PROMPT 1: Parse NL description into structured fields ───────
 
@@ -163,11 +163,11 @@ Response format (JSON only):
 
 def parse_nl_description(description: str) -> dict:
     """
-    Sends the NL textarea content to Claude.
+    Sends the NL textarea content to openai.
     Returns a dict matching AutofillResponse fields.
     """
     message = client.messages.create(
-        model="claude-sonnet-4-6",
+        model="openai-sonnet-4-6",
         max_tokens=512,
         system=AUTOFILL_SYSTEM_PROMPT,
         messages=[
@@ -180,7 +180,7 @@ def parse_nl_description(description: str) -> dict:
 
     raw = message.content[0].text.strip()
 
-    # Strip markdown code fences if Claude wraps in ```json
+    # Strip markdown code fences if openai wraps in ```json
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
 
@@ -231,7 +231,7 @@ def classify_hs_code(product_description: str, origin_country: Optional[str] = N
         user_content += f"\nOrigin country: {origin_country}"
 
     message = client.messages.create(
-        model="claude-sonnet-4-6",
+        model="openai-sonnet-4-6",
         max_tokens=512,
         system=HS_LOOKUP_SYSTEM_PROMPT,
         messages=[
@@ -312,7 +312,7 @@ def score_hs_confidence(hs_code: str, ai_confidence: int) -> int:
 
     Args:
         hs_code:       The HS/commodity code string
-        ai_confidence: Raw confidence from Claude (0–100)
+        ai_confidence: Raw confidence from openai (0–100)
 
     Returns:
         Final adjusted confidence score (0–100)
@@ -365,7 +365,7 @@ async def autofill(request: AutofillRequest):
 
     Flow:
       1. Check Redis cache (key: hash of description)
-      2. Cache miss → call Claude to parse NL description
+      2. Cache miss → call openai to parse NL description
       3. Adjust HS confidence using score_hs_confidence()
       4. Cache the result for 24 hours
       5. Return AutofillResponse
@@ -377,11 +377,11 @@ async def autofill(request: AutofillRequest):
         logger.info(f"Autofill cache HIT for description hash")
         return AutofillResponse(**cached, cached=True)
 
-    # Step 2 — Call Claude
+    # Step 2 — Call openai
     try:
         result = parse_nl_description(request.description)
     except Exception as e:
-        logger.error(f"Claude autofill failed: {e}")
+        logger.error(f"openai autofill failed: {e}")
         raise HTTPException(
             status_code=502,
             detail="AI service unavailable. Please fill fields manually."
@@ -425,7 +425,7 @@ async def hs_lookup(request: HSLookupRequest):
 
     Flow:
       1. Check Redis cache (key: hash of description + origin)
-      2. Cache miss → call Claude to classify HS code
+      2. Cache miss → call openai to classify HS code
       3. Adjust confidence using score_hs_confidence()
       4. Cache for 7 days
       5. Return HSLookupResponse
@@ -437,14 +437,14 @@ async def hs_lookup(request: HSLookupRequest):
         logger.info(f"HS lookup cache HIT")
         return HSLookupResponse(**cached, cached=True, source="cache")
 
-    # Step 2 — Call Claude
+    # Step 2 — Call openai
     try:
         result = classify_hs_code(
             request.product_description,
             request.origin_country
         )
     except Exception as e:
-        logger.error(f"Claude HS lookup failed: {e}")
+        logger.error(f"openai HS lookup failed: {e}")
         raise HTTPException(
             status_code=502,
             detail="AI classification unavailable. Please enter HS code manually."
@@ -460,7 +460,7 @@ async def hs_lookup(request: HSLookupRequest):
     set_hs_cache(request.product_description, request.origin_country, result)
 
     # Step 5 — Return
-    return HSLookupResponse(**result, cached=False, source="claude")
+    return HSLookupResponse(**result, cached=False, source="openai")
 ```
 
 ---
@@ -496,7 +496,7 @@ app.include_router(hs_lookup_router)
 fastapi==0.111.0
 uvicorn[standard]==0.30.1
 pydantic==2.7.1
-anthropic==0.28.0
+openapi==0.28.0
 redis==5.0.4
 python-dotenv==1.0.1
 httpx==0.27.0
@@ -508,7 +508,7 @@ httpx==0.27.0
 ### Environment variables
 
 ```
-ANTHROPIC_API_KEY=sk-ant-...
+openapi_API_KEY=sk-ant-...
 REDIS_URL=redis://localhost:6379
 ```
 
@@ -532,7 +532,7 @@ USER TYPES: "leather shoes from Birmingham to Paris, £2,000"
                      HIT ◄─┤─► MISS
                      │     │       │
                      │     │       ▼
-                     │     │  Claude Sonnet
+                     │     │  openai Sonnet
                      │     │  parse_nl_description()
                      │     │       │
                      │     │       ▼
@@ -564,7 +564,7 @@ USER CLICKS 🔍 (HS lookup button) or edits HS Code field:
                  └─────────┬──────────┘
                      HIT ◄─┤─► MISS
                            │       │
-                           │  Claude Sonnet
+                           │  openai Sonnet
                            │  classify_hs_code()
                            │       │
                            │  score_hs_confidence()
@@ -586,10 +586,10 @@ USER CLICKS 🔍 (HS lookup button) or edits HS Code field:
 
 | Scenario | HTTP Code | Frontend Behaviour |
 |---|---|---|
-| Claude API down | 502 | Show amber warning, keep fields editable manually |
-| Redis down | 200 (degrade) | Log error, skip cache, call Claude directly |
+| openai API down | 502 | Show amber warning, keep fields editable manually |
+| Redis down | 200 (degrade) | Log error, skip cache, call openai directly |
 | Description too short (<3 chars) | 422 | Pydantic validation, show inline field error |
-| Claude returns invalid JSON | 502 | Retry once, then return 502 |
+| openai returns invalid JSON | 502 | Retry once, then return 502 |
 | HS code not found / very low confidence | 200 | Return result with confidence <50, UI shows red bar + warning |
 
 ---
