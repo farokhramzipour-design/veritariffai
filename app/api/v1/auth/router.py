@@ -10,6 +10,7 @@ from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
 from app.core.jwt import create_jwt
 import time
+from fastapi import Response
 
 router = APIRouter()
 
@@ -165,3 +166,26 @@ async def refresh():
 @router.delete("/session")
 async def logout():
     return ok({"success": True})
+
+
+@router.get("/microsoft/login")
+async def login_microsoft():
+    raise HTTPException(status_code=501, detail="Microsoft login not implemented")
+
+
+@router.get("/academic/mock")
+async def academic_mock():
+    now = int(time.time())
+    token_payload = {
+        "sub": "academic-mock-user",
+        "email": "researcher@example.edu",
+        "name": "Academic Researcher",
+        "plan": "FREE",
+        "iat": now,
+        "exp": now + 3600 * 24,
+        "iss": settings.jwt_issuer,
+        "aud": settings.jwt_audience,
+        "role": "researcher"
+    }
+    app_access_token = create_jwt(token_payload)
+    return ok({"access_token": app_access_token, "token_type": "bearer", "user": {"email": "researcher@example.edu", "plan": "free", "role": "researcher"}})

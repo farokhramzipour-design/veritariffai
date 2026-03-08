@@ -6,6 +6,7 @@ from app.core.errors import APIError, api_error_handler, plan_upgrade_handler
 from app.domain.plan import PlanUpgradeRequired
 from app.core.responses import ok
 from app.core.middleware import RateLimitMiddleware
+from app.web.router import router as web_router
 
 
 def create_app() -> FastAPI:
@@ -24,6 +25,7 @@ def create_app() -> FastAPI:
     )
 
     # app.add_middleware(RateLimitMiddleware)
+    app.include_router(web_router)
     app.include_router(api_router, prefix=settings.api_prefix)
     app.add_exception_handler(APIError, api_error_handler)
     app.add_exception_handler(PlanUpgradeRequired, plan_upgrade_handler)
