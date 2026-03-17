@@ -11,6 +11,9 @@ from app.api.v1.duty_rate.router import router as duty_rate_router
 from app.api.v1.autofill.router import router as autofill_router
 from app.api.v1.hs_lookup.router import router as hs_lookup_router
 from app.api.v1.kyb.router import router as kyb_router
+from app.api.v1.classification.router import router as classification_router
+from app.api.v1.origin.router import router as origin_router
+from app.api.v1.compliance.router import router as compliance_router
 
 
 api_router = APIRouter()
@@ -26,3 +29,6 @@ api_router.include_router(duty_rate_router, tags=["duty-rate"])
 api_router.include_router(autofill_router, tags=["autofill"])
 api_router.include_router(hs_lookup_router, tags=["hs-lookup"])
 api_router.include_router(kyb_router, prefix="/kyb", tags=["kyb"])
+api_router.include_router(classification_router, prefix="/classification", tags=["classification"])
+api_router.include_router(origin_router, prefix="/origin", tags=["origin"])
+api_router.include_router(compliance_router, prefix="/compliance", tags=["compliance"])
