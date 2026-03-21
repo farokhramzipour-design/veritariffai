@@ -18,11 +18,17 @@ def _run_migrations() -> None:
     try:
         from alembic.config import Config
         from alembic import command
+        from app.infrastructure.database.session import _build_db_url
 
         alembic_cfg = Config("alembic.ini")
-        # Override the URL so alembic.ini doesn't need updating per environment
-        from app.infrastructure.database.session import _build_db_url
-        sync_url = _build_db_url().replace("+asyncpg", "+psycopg").replace("+aiosqlite", "")
+        # Build a synchronous URL from the same settings used by the async engine.
+        # asyncpg  → psycopg  (psycopg3 sync driver, already in requirements)
+        sync_url = (
+            _build_db_url()
+            .replace("postgresql+asyncpg://", "postgresql+psycopg://")
+            .replace("postgres+asyncpg://", "postgresql+psycopg://")
+        )
+        logger.info("Running migrations against: %s", sync_url.split("@")[-1])  # hide credentials
         alembic_cfg.set_main_option("sqlalchemy.url", sync_url)
         command.upgrade(alembic_cfg, "head")
         logger.info("Alembic migrations applied successfully.")

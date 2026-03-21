@@ -27,9 +27,27 @@ async def plan_upgrade_handler(request: Request, exc: PlanUpgradeRequired):
     )
 
 
+def _cors_headers(request: Request) -> dict:
+    """
+    Build explicit CORS headers for the response.
+
+    add_exception_handler(Exception, ...) binds to ServerErrorMiddleware which
+    sits OUTSIDE Starlette's CORSMiddleware, so CORS headers are never injected
+    automatically for unhandled 500 responses. We must set them manually.
+    """
+    origin = request.headers.get("origin", "*")
+    return {
+        "Access-Control-Allow-Origin": origin,
+        "Access-Control-Allow-Credentials": "true",
+        "Access-Control-Allow-Methods": "*",
+        "Access-Control-Allow-Headers": "*",
+    }
+
+
 async def unhandled_exception_handler(request: Request, exc: Exception):
     logger.exception("Unhandled exception on %s %s", request.method, request.url.path)
     return JSONResponse(
         status_code=500,
         content=error("INTERNAL_ERROR", "An unexpected error occurred. Please try again later."),
+        headers=_cors_headers(request),
     )
