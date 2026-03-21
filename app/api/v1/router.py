@@ -14,6 +14,7 @@ from app.api.v1.kyb.router import router as kyb_router
 from app.api.v1.classification.router import router as classification_router
 from app.api.v1.origin.router import router as origin_router
 from app.api.v1.compliance.router import router as compliance_router
+from app.api.v1.invoice.router import router as invoice_router
 
 
 api_router = APIRouter()
@@ -32,3 +33,4 @@ api_router.include_router(kyb_router, prefix="/kyb", tags=["kyb"])
 api_router.include_router(classification_router, prefix="/classification", tags=["classification"])
 api_router.include_router(origin_router, prefix="/origin", tags=["origin"])
 api_router.include_router(compliance_router, prefix="/compliance", tags=["compliance"])
+api_router.include_router(invoice_router, prefix="/invoice", tags=["invoice"])
