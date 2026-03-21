@@ -1,29 +1,111 @@
 from __future__ import annotations
-from fastapi import APIRouter, Request, HTTPException
-from fastapi.responses import RedirectResponse
-from pydantic import BaseModel
-from app.core.responses import ok
-from app.config import settings
-import requests
+
+import time
+import logging
 from typing import Optional
+
+import jwt as pyjwt
+import requests
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import RedirectResponse
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
-from app.core.jwt import create_jwt
-import time
-import jwt as pyjwt
+from pydantic import BaseModel
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
+from app.core.jwt import create_jwt
+from app.core.responses import ok
+from app.infrastructure.database.models import User
+from app.infrastructure.database.session import get_session
+
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
-class GoogleAuthRequest(BaseModel):
-    id_token: str
-    role: Optional[str] = None
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _build_token(db_user: User, extra: dict | None = None) -> str:
+    """Issue a signed JWT that includes the DB UUID as `user_id`."""
+    now = int(time.time())
+    payload = {
+        "sub": str(db_user.google_sub),   # keep sub for compatibility
+        "user_id": str(db_user.id),        # ← DB UUID used everywhere internally
+        "email": db_user.email,
+        "name": db_user.display_name or db_user.email,
+        "plan": db_user.plan.upper(),
+        "iat": now,
+        "exp": now + 3600 * 24,
+        "iss": settings.jwt_issuer,
+        "aud": settings.jwt_audience,
+    }
+    if extra:
+        payload.update(extra)
+    return create_jwt(payload)
+
+
+async def _upsert_user(
+    db: AsyncSession,
+    *,
+    google_sub: str,
+    email: str,
+    display_name: str | None = None,
+    avatar_url: str | None = None,
+) -> User:
+    """Get or create a user row, returning the ORM object."""
+    result = await db.execute(
+        select(User).where(User.google_sub == google_sub)
+    )
+    user = result.scalar_one_or_none()
+
+    if user is None:
+        # Try by email (handles accounts that previously signed in differently)
+        result = await db.execute(select(User).where(User.email == email))
+        user = result.scalar_one_or_none()
+
+    if user is None:
+        user = User(
+            google_sub=google_sub,
+            email=email,
+            display_name=display_name,
+            avatar_url=avatar_url,
+            plan="free",
+        )
+        db.add(user)
+        await db.commit()
+        await db.refresh(user)
+        logger.info("Created new user id=%s email=%s", user.id, user.email)
+    else:
+        # Keep profile fields fresh
+        changed = False
+        if display_name and user.display_name != display_name:
+            user.display_name = display_name
+            changed = True
+        if avatar_url and user.avatar_url != avatar_url:
+            user.avatar_url = avatar_url
+            changed = True
+        if user.google_sub != google_sub:
+            user.google_sub = google_sub
+            changed = True
+        if changed:
+            await db.commit()
+            await db.refresh(user)
+
+    return user
+
+
+# ---------------------------------------------------------------------------
+# Google OAuth – redirect flow
+# ---------------------------------------------------------------------------
 
 @router.get("/google/login")
 async def login_google():
     if not settings.google_client_id or not settings.google_redirect_uri:
         raise HTTPException(status_code=500, detail="Google Auth not configured")
-    
-    google_auth_url = (
+    url = (
         "https://accounts.google.com/o/oauth2/v2/auth"
         f"?client_id={settings.google_client_id}"
         f"&redirect_uri={settings.google_redirect_uri}"
@@ -32,133 +114,102 @@ async def login_google():
         "&access_type=offline"
         "&prompt=consent"
     )
-    return RedirectResponse(url=google_auth_url)
+    return RedirectResponse(url=url)
+
 
 @router.get("/google/callback")
-async def callback_google(code: str, error: Optional[str] = None):
+async def callback_google(
+    code: str,
+    error: Optional[str] = None,
+    db: AsyncSession = Depends(get_session),
+):
     if error:
         raise HTTPException(status_code=400, detail=f"Google Auth Error: {error}")
-    
     if not settings.google_client_id or not settings.google_client_secret or not settings.google_redirect_uri:
         raise HTTPException(status_code=500, detail="Google Auth not configured")
 
-    # Exchange code for tokens
-    token_url = "https://oauth2.googleapis.com/token"
-    data = {
-        "client_id": settings.google_client_id,
-        "client_secret": settings.google_client_secret,
-        "code": code,
-        "grant_type": "authorization_code",
-        "redirect_uri": settings.google_redirect_uri,
-    }
-    
-    response = requests.post(token_url, data=data)
-    if response.status_code != 200:
+    token_resp = requests.post(
+        "https://oauth2.googleapis.com/token",
+        data={
+            "client_id": settings.google_client_id,
+            "client_secret": settings.google_client_secret,
+            "code": code,
+            "grant_type": "authorization_code",
+            "redirect_uri": settings.google_redirect_uri,
+        },
+    )
+    if token_resp.status_code != 200:
         raise HTTPException(status_code=400, detail="Failed to retrieve token from Google")
-    
-    tokens = response.json()
-    id_token_str = tokens.get("id_token")
-    
-    # Decode the ID token to get user info (without verification for now, as we trust the direct response from Google)
-    # In a production environment, you should verify the signature, but since we just got it from Google via HTTPS, it's reasonably safe for extraction.
-    # However, to be strictly correct, we should verify it.
-    
+
+    id_token_str = token_resp.json().get("id_token")
     try:
-        # We use the google library to verify and decode
         id_info = id_token.verify_oauth2_token(
-            id_token_str, 
-            google_requests.Request(), 
-            settings.google_client_id
+            id_token_str, google_requests.Request(), settings.google_client_id
         )
-        
-        google_user_id = id_info['sub']
-        email = id_info.get('email')
-        name = id_info.get('name')
-        
-        # Generate OUR application JWT
-        now = int(time.time())
-        token_payload = {
-            "sub": google_user_id, # Or your internal user ID
-            "email": email,
-            "name": name,
-            "plan": "FREE", # Default plan
-            "iat": now,
-            "exp": now + 3600 * 24, # 24 hours
-            "iss": settings.jwt_issuer,
-            "aud": settings.jwt_audience
-        }
-        
-        app_access_token = create_jwt(token_payload)
-        
-        # Redirect to frontend with OUR application token
-        redirect_url = f"https://veritariffai.co?token={app_access_token}"
-        return RedirectResponse(url=redirect_url)
-        
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=f"Invalid Google token: {str(e)}")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid Google token: {exc}")
+
+    user = await _upsert_user(
+        db,
+        google_sub=id_info["sub"],
+        email=id_info.get("email", ""),
+        display_name=id_info.get("name"),
+        avatar_url=id_info.get("picture"),
+    )
+    token = _build_token(user)
+    return RedirectResponse(url=f"https://veritariffai.co?token={token}")
+
+
+# ---------------------------------------------------------------------------
+# Google OAuth – token flow (frontend sends Google ID token directly)
+# ---------------------------------------------------------------------------
+
+class GoogleAuthRequest(BaseModel):
+    id_token: str
+    role: Optional[str] = None
 
 
 @router.post("/google")
-async def auth_google(payload: GoogleAuthRequest):
-    """
-    Verifies the Google ID token sent by the frontend, creates/retrieves the user,
-    and returns an application-specific access token (JWT).
-    """
+async def auth_google(
+    payload: GoogleAuthRequest,
+    db: AsyncSession = Depends(get_session),
+):
     try:
-        # Verify the token
         id_info = id_token.verify_oauth2_token(
-            payload.id_token, 
-            google_requests.Request(), 
-            settings.google_client_id
+            payload.id_token, google_requests.Request(), settings.google_client_id
         )
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail=f"Invalid Google token: {exc}")
+    except Exception as exc:
+        logger.exception("Google token verification failed")
+        raise HTTPException(status_code=500, detail=f"Authentication failed: {exc}")
 
-        # ID token is valid. Get the user's Google Account ID from the decoded token.
-        google_user_id = id_info['sub']
-        email = id_info.get('email')
-        name = id_info.get('name')
-        picture = id_info.get('picture')
+    user = await _upsert_user(
+        db,
+        google_sub=id_info["sub"],
+        email=id_info.get("email", ""),
+        display_name=id_info.get("name"),
+        avatar_url=id_info.get("picture"),
+    )
+    token = _build_token(user, extra={"role": payload.role or "researcher"})
 
-        # TODO: Implement User Logic
-        # 1. Check if user exists in DB by email or google_user_id
-        # 2. If not, create a new user record
-        
-        # 3. Generate a JWT for YOUR application (not the Google one)
-        # We need to generate a token that our own verify_jwt function can understand (HS256)
-        
-        now = int(time.time())
-        token_payload = {
-            "sub": google_user_id, # Or your internal user ID
-            "email": email,
-            "name": name,
-            "plan": "FREE", # Default plan
-            "role": payload.role or "researcher",
-            "iat": now,
-            "exp": now + 3600 * 24, # 24 hours
-            "iss": settings.jwt_issuer,
-            "aud": settings.jwt_audience
-        }
-        
-        access_token = create_jwt(token_payload)
-        
-        return ok({
-            "access_token": access_token, 
-            "token_type": "bearer", 
-            "expires_in": 3600 * 24, 
-            "user": {
-                "id": google_user_id,
-                "email": email, 
-                "display_name": name, 
-                "picture": picture,
-                "plan": "free"
-            }
-        })
+    return ok({
+        "access_token": token,
+        "token_type": "bearer",
+        "expires_in": 3600 * 24,
+        "user": {
+            "id": str(user.id),
+            "email": user.email,
+            "display_name": user.display_name,
+            "picture": user.avatar_url,
+            "plan": user.plan,
+        },
+    })
 
-    except ValueError as e:
-        # Invalid token
-        raise HTTPException(status_code=401, detail=f"Invalid Google token: {str(e)}")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Authentication failed: {str(e)}")
 
+# ---------------------------------------------------------------------------
+# Microsoft OAuth
+# ---------------------------------------------------------------------------
 
 class MicrosoftAuthRequest(BaseModel):
     id_token: str
@@ -166,40 +217,47 @@ class MicrosoftAuthRequest(BaseModel):
 
 
 @router.post("/microsoft")
-async def auth_microsoft(payload: MicrosoftAuthRequest):
+async def auth_microsoft(
+    payload: MicrosoftAuthRequest,
+    db: AsyncSession = Depends(get_session),
+):
     try:
-        decoded = pyjwt.decode(payload.id_token, options={"verify_signature": False, "verify_aud": False})
-        sub = str(decoded.get("sub") or decoded.get("oid") or decoded.get("tid") or "microsoft-user")
-        email = decoded.get("email") or decoded.get("upn")
-        name = decoded.get("name") or decoded.get("preferred_username") or email or sub
-        now = int(time.time())
-        token_payload = {
-            "sub": f"ms:{sub}",
-            "email": email or f"{sub}@example.com",
-            "name": name,
-            "plan": "FREE",
-            "role": payload.role or "researcher",
-            "iat": now,
-            "exp": now + 3600 * 24,
-            "iss": settings.jwt_issuer,
-            "aud": settings.jwt_audience,
-        }
-        access_token = create_jwt(token_payload)
-        return ok({
-            "access_token": access_token,
-            "token_type": "bearer",
-            "expires_in": 3600 * 24,
-            "user": {
-                "id": token_payload["sub"],
-                "email": token_payload["email"],
-                "display_name": token_payload["name"],
-                "plan": "free",
-                "role": token_payload["role"],
-            },
-        })
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Authentication failed: {str(e)}")
+        decoded = pyjwt.decode(
+            payload.id_token,
+            options={"verify_signature": False, "verify_aud": False},
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid Microsoft token: {exc}")
 
+    ms_sub = str(decoded.get("sub") or decoded.get("oid") or decoded.get("tid") or "")
+    email = decoded.get("email") or decoded.get("upn") or f"{ms_sub}@microsoft.com"
+    name = decoded.get("name") or decoded.get("preferred_username") or email
+
+    user = await _upsert_user(
+        db,
+        google_sub=f"ms:{ms_sub}",   # namespace to avoid collision with Google subs
+        email=email,
+        display_name=name,
+    )
+    token = _build_token(user, extra={"role": payload.role or "researcher"})
+
+    return ok({
+        "access_token": token,
+        "token_type": "bearer",
+        "expires_in": 3600 * 24,
+        "user": {
+            "id": str(user.id),
+            "email": user.email,
+            "display_name": user.display_name,
+            "plan": user.plan,
+            "role": payload.role or "researcher",
+        },
+    })
+
+
+# ---------------------------------------------------------------------------
+# Academic / mock login (dev & demo)
+# ---------------------------------------------------------------------------
 
 class AcademicMockRequest(BaseModel):
     email: str
@@ -208,34 +266,38 @@ class AcademicMockRequest(BaseModel):
 
 
 @router.post("/academic/mock")
-async def auth_academic_mock(payload: AcademicMockRequest):
+async def auth_academic_mock(
+    payload: AcademicMockRequest,
+    db: AsyncSession = Depends(get_session),
+):
     if not settings.academic_mock_enabled:
         raise HTTPException(status_code=403, detail="Academic auth disabled")
-    now = int(time.time())
-    token_payload = {
-        "sub": f"ac:{payload.email}",
-        "email": payload.email,
-        "name": payload.name or payload.email,
-        "plan": "FREE",
-        "role": payload.role or "researcher",
-        "iat": now,
-        "exp": now + 3600 * 24,
-        "iss": settings.jwt_issuer,
-        "aud": settings.jwt_audience,
-    }
-    access_token = create_jwt(token_payload)
+
+    user = await _upsert_user(
+        db,
+        google_sub=f"ac:{payload.email}",
+        email=payload.email,
+        display_name=payload.name or payload.email,
+    )
+    token = _build_token(user, extra={"role": payload.role or "researcher"})
+
     return ok({
-        "access_token": access_token,
+        "access_token": token,
         "token_type": "bearer",
         "expires_in": 3600 * 24,
         "user": {
-            "id": token_payload["sub"],
-            "email": token_payload["email"],
-            "display_name": token_payload["name"],
-            "plan": "free",
-            "role": token_payload["role"],
+            "id": str(user.id),
+            "email": user.email,
+            "display_name": user.display_name,
+            "plan": user.plan,
+            "role": payload.role or "researcher",
         },
     })
+
+
+# ---------------------------------------------------------------------------
+# Session management
+# ---------------------------------------------------------------------------
 
 @router.post("/refresh")
 async def refresh():

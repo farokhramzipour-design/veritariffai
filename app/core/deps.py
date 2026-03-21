@@ -27,7 +27,8 @@ async def get_current_user(authorization: Annotated[str | None, Header(alias="Au
         claims = verify_jwt(token)
     except Exception:
         raise APIError(401, "UNAUTHENTICATED", "Invalid JWT")
-    user_id = str(claims.get("sub") or claims.get("user_id") or "")
+    # Prefer the DB UUID stored as "user_id"; fall back to "sub" for legacy tokens
+    user_id = str(claims.get("user_id") or claims.get("sub") or "")
     if not user_id:
         raise APIError(401, "UNAUTHENTICATED", "Invalid JWT")
     blocked = False
