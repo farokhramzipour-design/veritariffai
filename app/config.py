@@ -7,6 +7,7 @@ class Settings(BaseSettings):
     app_name: str = "Trade Cost Engine"
     api_prefix: str = "/api/v1"
     environment: str = Field(default="local")
+    debug: bool = Field(default=False, description="Include exception details in 500 responses")
     secret_key: str = Field(default="dev-secret")
     redis_url: str = Field(default="redis://localhost:6379/0")
     celery_broker_url: str | None = None

@@ -103,9 +103,9 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
         },
     )
 
-    # In non-production environments include the real error in the response
-    # so developers can debug without needing server log access.
-    if settings.environment != "production":
+    # Include the real error in the response when debug mode is on
+    # or when not in production (set DEBUG=true in .env to enable on prod).
+    if settings.debug or settings.environment != "production":
         details = {
             "exc_type": type(exc).__name__,
             "exc_message": str(exc),
