@@ -15,6 +15,7 @@ from sqlalchemy import (
     Index,
     ForeignKey,
     SmallInteger,
+    func,
 )
 from sqlalchemy.dialects.postgresql import UUID, JSONB, ARRAY, NUMERIC, BYTEA
 from sqlalchemy.orm import Mapped, mapped_column
@@ -145,6 +146,45 @@ class CalculationResult(Base):
 
 Index("idx_calc_results_user_id", CalculationResult.user_id, schema="calculations")
 Index("idx_calc_results_created_at", CalculationResult.created_at, schema="calculations")
+
+# ---------- calculations.calculation_profiles ----------
+
+
+FREE_TIER_PROFILE_LIMIT = 5
+
+
+class CalculationProfile(Base):
+    """
+    A named, saved calculation that a user can revisit and edit.
+    Free-tier users are capped at FREE_TIER_PROFILE_LIMIT profiles.
+    """
+
+    __tablename__ = "calculation_profiles"
+    __table_args__ = {"schema": "calculations"}
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid4)
+    user_id: Mapped[str] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("identity.users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[Optional[str]] = mapped_column(Text)
+    # Mirror of CalculationRequest fields
+    shipment_data: Mapped[dict] = mapped_column(JSONB, nullable=False)  # {origin, destination, fx_date}
+    lines_data: Mapped[list] = mapped_column(JSONB, nullable=False)     # [{hs_code, description, ...}]
+    # Cached result from the most recent run (may be null if never executed)
+    last_result: Mapped[Optional[dict]] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+Index("idx_calc_profiles_user_id", CalculationProfile.user_id, schema="calculations")
+Index("idx_calc_profiles_updated_at", CalculationProfile.updated_at, schema="calculations")
 
 # ---------- tariff.hs_codes ----------
 
