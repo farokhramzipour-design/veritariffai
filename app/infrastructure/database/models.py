@@ -54,9 +54,9 @@ class User(Base):
 
     __mapper_args__ = {"eager_defaults": True}
 
-Index("idx_users_google_sub", User.google_sub, postgresql_where=None, schema="identity")
-Index("idx_users_email", User.email, postgresql_where=None, schema="identity")
-Index("idx_users_stripe_customer_id", User.stripe_customer_id, schema="identity")
+Index("idx_users_google_sub", User.google_sub)
+Index("idx_users_email", User.email)
+Index("idx_users_stripe_customer_id", User.stripe_customer_id)
 
 # ---------- subscriptions.subscription_events ----------
 
@@ -75,7 +75,7 @@ class SubscriptionEvent(Base):
     from_plan: Mapped[Optional[str]] = mapped_column(String(20))
     to_plan: Mapped[Optional[str]] = mapped_column(String(20))
     stripe_event_id: Mapped[Optional[str]] = mapped_column(String(255), unique=True)
-    metadata: Mapped[Optional[dict]] = mapped_column(JSONB)
+    event_metadata: Mapped[Optional[dict]] = mapped_column("metadata", JSONB)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=datetime.utcnow
     )
@@ -103,22 +103,9 @@ class CalculationRequest(Base):
     )
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
 
-Index(
-    "idx_calc_requests_user_id",
-    CalculationRequest.user_id,
-    schema="calculations",
-)
-Index(
-    "idx_calc_requests_status",
-    CalculationRequest.status,
-    postgresql_where=None,
-    schema="calculations",
-)
-Index(
-    "idx_calc_requests_created_at",
-    CalculationRequest.created_at,
-    schema="calculations",
-)
+Index("idx_calc_requests_user_id", CalculationRequest.user_id)
+Index("idx_calc_requests_status", CalculationRequest.status)
+Index("idx_calc_requests_created_at", CalculationRequest.created_at)
 
 # ---------- calculations.calculation_results ----------
 
@@ -144,8 +131,8 @@ class CalculationResult(Base):
         DateTime(timezone=True), nullable=False, default=datetime.utcnow
     )
 
-Index("idx_calc_results_user_id", CalculationResult.user_id, schema="calculations")
-Index("idx_calc_results_created_at", CalculationResult.created_at, schema="calculations")
+Index("idx_calc_results_user_id", CalculationResult.user_id)
+Index("idx_calc_results_created_at", CalculationResult.created_at)
 
 # ---------- calculations.calculation_profiles ----------
 
@@ -183,8 +170,8 @@ class CalculationProfile(Base):
     )
 
 
-Index("idx_calc_profiles_user_id", CalculationProfile.user_id, schema="calculations")
-Index("idx_calc_profiles_updated_at", CalculationProfile.updated_at, schema="calculations")
+Index("idx_calc_profiles_user_id", CalculationProfile.user_id)
+Index("idx_calc_profiles_updated_at", CalculationProfile.updated_at)
 
 # ---------- tariff.hs_codes ----------
 
@@ -230,7 +217,7 @@ class TariffMeasure(Base):
     source_measure_id: Mapped[Optional[str]] = mapped_column(String(100))
     ingested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
 
-Index("idx_tariff_measures_hs_code", TariffMeasure.hs_code, schema="tariff")
+Index("idx_tariff_measures_hs_code", TariffMeasure.hs_code)
 Index(
     "idx_tariff_measures_lookup",
     TariffMeasure.hs_code,
@@ -238,14 +225,8 @@ Index(
     TariffMeasure.country_of_origin,
     TariffMeasure.valid_from,
     TariffMeasure.valid_to,
-    schema="tariff",
 )
-Index(
-    "idx_tariff_measures_valid",
-    TariffMeasure.valid_to,
-    postgresql_where=None,
-    schema="tariff",
-)
+Index("idx_tariff_measures_valid", TariffMeasure.valid_to)
 
 # ---------- tariff.tariff_quotas ----------
 
@@ -306,7 +287,6 @@ Index(
     FXRate.rate_type,
     FXRate.effective_date,
     unique=True,
-    schema="fx",
 )
 Index(
     "idx_fx_rates_lookup",
@@ -314,7 +294,6 @@ Index(
     FXRate.quote_currency,
     FXRate.rate_type,
     FXRate.effective_date.desc(),
-    schema="fx",
 )
 
 # ---------- compliance.restricted_goods ----------
