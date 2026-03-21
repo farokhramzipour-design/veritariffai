@@ -1,9 +1,11 @@
 from __future__ import annotations
-from fastapi import HTTPException, status
+import logging
+from fastapi import HTTPException, Request, status
 from app.domain.plan import PlanUpgradeRequired
 from app.core.responses import error
 from fastapi.responses import JSONResponse
-from fastapi import Request
+
+logger = logging.getLogger(__name__)
 
 
 class APIError(HTTPException):
@@ -22,4 +24,12 @@ async def plan_upgrade_handler(request: Request, exc: PlanUpgradeRequired):
     return JSONResponse(
         status_code=status.HTTP_403_FORBIDDEN,
         content=error("PLAN_UPGRADE_REQUIRED", "This feature requires a Pro subscription.", {"required_plan": "pro", "upgrade_url": exc.upgrade_url}),
+    )
+
+
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    logger.exception("Unhandled exception on %s %s", request.method, request.url.path)
+    return JSONResponse(
+        status_code=500,
+        content=error("INTERNAL_ERROR", "An unexpected error occurred. Please try again later."),
     )
