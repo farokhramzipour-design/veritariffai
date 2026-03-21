@@ -5,10 +5,18 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
+from app.core.logging_config import configure_logging
+
+# Configure logging before anything else imports a logger
+configure_logging(
+    environment=settings.environment,
+    log_level="DEBUG" if settings.environment == "local" else "INFO",
+)
+
 from app.api.v1.router import api_router
 from app.core.errors import APIError, api_error_handler, plan_upgrade_handler, unhandled_exception_handler
 from app.domain.plan import PlanUpgradeRequired
-from app.core.middleware import RateLimitMiddleware
+from app.core.middleware import RateLimitMiddleware, RequestLoggingMiddleware
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +67,7 @@ def create_app() -> FastAPI:
     )
 
     # app.add_middleware(RateLimitMiddleware)
+    app.add_middleware(RequestLoggingMiddleware)
     app.include_router(api_router, prefix=settings.api_prefix)
     app.add_exception_handler(APIError, api_error_handler)
     app.add_exception_handler(PlanUpgradeRequired, plan_upgrade_handler)

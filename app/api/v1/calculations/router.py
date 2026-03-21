@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, select
@@ -23,7 +23,15 @@ router = APIRouter()
 FREE_LIMIT = FREE_TIER_PROFILE_LIMIT  # 5
 
 
-# ── Helper ────────────────────────────────────────────────────────────────────
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def _user_uuid(user: CurrentUser) -> UUID:
+    """Convert the string user.id (from JWT) to a proper UUID for DB queries.
+
+    asyncpg with UUID(as_uuid=True) is strict — it rejects plain strings.
+    """
+    return UUID(user.id)
+
 
 def _profile_to_dict(p: CalculationProfile) -> dict:
     return {
@@ -39,7 +47,47 @@ def _profile_to_dict(p: CalculationProfile) -> dict:
     }
 
 
-# ── Calculation profiles (registered before /{param} routes) ─────────────────
+async def _count_profiles(db: AsyncSession, user_uuid: UUID) -> int:
+    """Count how many profiles a user owns."""
+    result = await db.execute(
+        select(func.count(CalculationProfile.id)).where(
+            CalculationProfile.user_id == user_uuid
+        )
+    )
+    return result.scalar_one()
+
+
+# ── Quota / usage endpoints ────────────────────────────────────────────────────
+
+@router.get(
+    "/quota",
+    summary="Get calculation quota for the current user",
+    tags=["calculation-profiles"],
+)
+async def get_quota(
+    user: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_session),
+):
+    """
+    Returns how many calculation profiles the current user has used,
+    what their limit is, and how many slots remain.
+
+    - **Free users**: limit of 5 profiles.
+    - **PRO users**: unlimited (limit returned as null).
+    """
+    used = await _count_profiles(db, _user_uuid(user))
+    is_free = user.plan == PlanTier.FREE
+
+    return ok({
+        "used": used,
+        "limit": FREE_LIMIT if is_free else None,
+        "remaining": max(0, FREE_LIMIT - used) if is_free else None,
+        "can_add": (used < FREE_LIMIT) if is_free else True,
+        "plan": user.plan,
+    })
+
+
+# ── Calculation profiles ───────────────────────────────────────────────────────
 
 @router.post(
     "/profiles",
@@ -58,11 +106,10 @@ async def create_profile(
     **Free tier:** maximum **5** profiles. Returns HTTP 403 when the limit is reached.
     PRO users have no limit.
     """
+    uid = _user_uuid(user)
+
     if user.plan == PlanTier.FREE:
-        count_result = await db.execute(
-            select(func.count()).where(CalculationProfile.user_id == user.id)
-        )
-        count = count_result.scalar_one()
+        count = await _count_profiles(db, uid)
         if count >= FREE_LIMIT:
             raise HTTPException(
                 status_code=403,
@@ -78,8 +125,8 @@ async def create_profile(
             )
 
     profile = CalculationProfile(
-        id=str(uuid4()),
-        user_id=user.id,
+        id=uuid4(),
+        user_id=uid,
         name=payload.name,
         description=payload.description,
         shipment_data=payload.shipment_data,
@@ -89,7 +136,37 @@ async def create_profile(
     db.add(profile)
     await db.commit()
     await db.refresh(profile)
-    return ok(_profile_to_dict(profile))
+
+    new_count = await _count_profiles(db, uid)
+    is_free = user.plan == PlanTier.FREE
+
+    result = _profile_to_dict(profile)
+    result["quota"] = {
+        "used": new_count,
+        "limit": FREE_LIMIT if is_free else None,
+        "remaining": max(0, FREE_LIMIT - new_count) if is_free else None,
+        "can_add": (new_count < FREE_LIMIT) if is_free else True,
+    }
+    return ok(result)
+
+
+@router.get(
+    "/profiles/count",
+    summary="Count the current user's saved calculation profiles",
+    tags=["calculation-profiles"],
+)
+async def count_profiles(
+    user: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_session),
+):
+    """Returns the total number of saved calculation profiles for the current user."""
+    count = await _count_profiles(db, _user_uuid(user))
+    is_free = user.plan == PlanTier.FREE
+    return ok({
+        "count": count,
+        "limit": FREE_LIMIT if is_free else None,
+        "remaining": max(0, FREE_LIMIT - count) if is_free else None,
+    })
 
 
 @router.get(
@@ -103,14 +180,12 @@ async def list_profiles(
     user: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_session),
 ):
-    total_result = await db.execute(
-        select(func.count()).where(CalculationProfile.user_id == user.id)
-    )
-    total = total_result.scalar_one()
+    uid = _user_uuid(user)
+    total = await _count_profiles(db, uid)
 
     rows_result = await db.execute(
         select(CalculationProfile)
-        .where(CalculationProfile.user_id == user.id)
+        .where(CalculationProfile.user_id == uid)
         .order_by(CalculationProfile.updated_at.desc())
         .limit(limit)
         .offset(offset)
@@ -139,10 +214,16 @@ async def get_profile(
     user: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_session),
 ):
+    uid = _user_uuid(user)
+    try:
+        pid = UUID(profile_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Profile not found.")
+
     result = await db.execute(
         select(CalculationProfile).where(
-            CalculationProfile.id == profile_id,
-            CalculationProfile.user_id == user.id,
+            CalculationProfile.id == pid,
+            CalculationProfile.user_id == uid,
         )
     )
     profile = result.scalar_one_or_none()
@@ -162,13 +243,17 @@ async def update_profile(
     user: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_session),
 ):
-    """
-    Partially update a profile. Only fields present in the request body are changed.
-    """
+    """Partially update a profile. Only fields present in the request body are changed."""
+    uid = _user_uuid(user)
+    try:
+        pid = UUID(profile_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Profile not found.")
+
     result = await db.execute(
         select(CalculationProfile).where(
-            CalculationProfile.id == profile_id,
-            CalculationProfile.user_id == user.id,
+            CalculationProfile.id == pid,
+            CalculationProfile.user_id == uid,
         )
     )
     profile = result.scalar_one_or_none()
@@ -193,10 +278,16 @@ async def delete_profile(
     user: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_session),
 ):
+    uid = _user_uuid(user)
+    try:
+        pid = UUID(profile_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Profile not found.")
+
     result = await db.execute(
         select(CalculationProfile).where(
-            CalculationProfile.id == profile_id,
-            CalculationProfile.user_id == user.id,
+            CalculationProfile.id == pid,
+            CalculationProfile.user_id == uid,
         )
     )
     profile = result.scalar_one_or_none()

@@ -16,14 +16,52 @@ class APIError(HTTPException):
         self.details = details or {}
 
 
+def _request_id(request: Request) -> str:
+    return getattr(request.state, "request_id", "-")
+
+
 async def api_error_handler(request: Request, exc: APIError):
-    return JSONResponse(status_code=exc.status_code, content=error(exc.code, exc.message, exc.details))
+    log = logger.warning if exc.status_code < 500 else logger.error
+    log(
+        "APIError %d [%s] on %s %s — %s",
+        exc.status_code,
+        exc.code,
+        request.method,
+        request.url.path,
+        exc.message,
+        extra={
+            "request_id": _request_id(request),
+            "status": exc.status_code,
+            "error_code": exc.code,
+            "path": request.url.path,
+            "method": request.method,
+        },
+    )
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=error(exc.code, exc.message, exc.details),
+    )
 
 
 async def plan_upgrade_handler(request: Request, exc: PlanUpgradeRequired):
+    logger.warning(
+        "PlanUpgradeRequired on %s %s — required: %s",
+        request.method,
+        request.url.path,
+        exc.required_plan,
+        extra={
+            "request_id": _request_id(request),
+            "path": request.url.path,
+            "required_plan": str(exc.required_plan),
+        },
+    )
     return JSONResponse(
         status_code=status.HTTP_403_FORBIDDEN,
-        content=error("PLAN_UPGRADE_REQUIRED", "This feature requires a Pro subscription.", {"required_plan": "pro", "upgrade_url": exc.upgrade_url}),
+        content=error(
+            "PLAN_UPGRADE_REQUIRED",
+            "This feature requires a Pro subscription.",
+            {"required_plan": "pro", "upgrade_url": exc.upgrade_url},
+        ),
     )
 
 
@@ -45,7 +83,18 @@ def _cors_headers(request: Request) -> dict:
 
 
 async def unhandled_exception_handler(request: Request, exc: Exception):
-    logger.exception("Unhandled exception on %s %s", request.method, request.url.path)
+    logger.exception(
+        "Unhandled %s on %s %s",
+        type(exc).__name__,
+        request.method,
+        request.url.path,
+        extra={
+            "request_id": _request_id(request),
+            "exc_type": type(exc).__name__,
+            "path": request.url.path,
+            "method": request.method,
+        },
+    )
     return JSONResponse(
         status_code=500,
         content=error("INTERNAL_ERROR", "An unexpected error occurred. Please try again later."),
