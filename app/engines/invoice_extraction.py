@@ -168,7 +168,6 @@ def _call_openai(raw_text: str) -> dict:
             ],
             temperature=0.1,
             max_tokens=2048,
-            response_format={"type": "json_object"},
         )
         raw_resp = resp.choices[0].message.content.strip()  # type: ignore
     else:
