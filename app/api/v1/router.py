@@ -19,6 +19,7 @@ from app.api.v1.classification.router import router as classification_router
 from app.api.v1.origin.router import router as origin_router
 from app.api.v1.compliance.router import router as compliance_router
 from app.api.v1.invoice.router import router as invoice_router
+from app.api.v1.workflow.router import router as workflow_router
 
 
 # ── Public routes (no token required) ────────────────────────────────────────
@@ -42,6 +43,7 @@ _protected.include_router(classification_router, prefix="/classification", tags=
 _protected.include_router(origin_router, prefix="/origin", tags=["origin"])
 _protected.include_router(compliance_router, prefix="/compliance", tags=["compliance"])
 _protected.include_router(invoice_router, prefix="/invoice", tags=["invoice"])
+_protected.include_router(workflow_router, prefix="/workflow", tags=["workflow"])
 
 # ── Master router ─────────────────────────────────────────────────────────────
 api_router = APIRouter()
