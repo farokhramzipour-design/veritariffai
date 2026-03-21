@@ -1,5 +1,6 @@
 from __future__ import annotations
 import logging
+import sys
 import traceback
 from fastapi import HTTPException, Request, status
 from app.domain.plan import PlanUpgradeRequired
@@ -87,15 +88,26 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
     from app.config import settings
 
     tb = traceback.format_exc()
+    rid = _request_id(request)
+
+    # Write directly to stderr — guaranteed to appear in every hosting platform's
+    # log viewer regardless of Python logging configuration.
+    print(
+        f"\n[500 ERROR] request_id={rid}"
+        f"\n  {request.method} {request.url.path}"
+        f"\n  {type(exc).__name__}: {exc}"
+        f"\n{tb}",
+        file=sys.stderr,
+        flush=True,
+    )
 
     logger.exception(
-        "Unhandled %s on %s %s\n%s",
+        "Unhandled %s on %s %s",
         type(exc).__name__,
         request.method,
         request.url.path,
-        tb,
         extra={
-            "request_id": _request_id(request),
+            "request_id": rid,
             "exc_type": type(exc).__name__,
             "exc_message": str(exc),
             "path": request.url.path,
