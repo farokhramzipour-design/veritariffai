@@ -123,6 +123,8 @@ async def lookup_commodity(
     # Fetch from HMRC API
     # ------------------------------------------------------------------
     url = f"{_BASE_URL}/{hs}"
+    logger.info("tariff_lookup: fetching %s origin=%s dest=%s", url, origin, dest)
+
     try:
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
             resp = await client.get(
@@ -130,14 +132,36 @@ async def lookup_commodity(
                 params={"currency": "GBP"},
                 headers={"Accept": "application/json"},
             )
+        logger.info(
+            "tariff_lookup: HMRC response status=%d url=%s",
+            resp.status_code, str(resp.url),
+        )
         resp.raise_for_status()
         payload = resp.json()
+        logger.debug(
+            "tariff_lookup: payload keys=%s included_count=%d",
+            list(payload.keys()),
+            len(payload.get("included", [])),
+        )
     except httpx.HTTPStatusError as exc:
+        print(
+            f"[tariff_lookup ERROR] HTTP {exc.response.status_code} from HMRC API\n"
+            f"  URL: {exc.request.url}\n"
+            f"  Body: {exc.response.text[:500]}",
+            flush=True,
+        )
+        logger.error(
+            "tariff_lookup: HTTP %d from HMRC API url=%s body=%s",
+            exc.response.status_code, exc.request.url, exc.response.text[:500],
+        )
         if exc.response.status_code == 404:
             return _error_result(hs_code, origin, dest, f"Commodity {hs_code} not found in UK Trade Tariff.")
         return _error_result(hs_code, origin, dest, f"HMRC API error {exc.response.status_code}.")
     except Exception as exc:
-        logger.exception("HMRC API fetch failed for %s", hs)
+        import traceback
+        tb = traceback.format_exc()
+        print(f"[tariff_lookup ERROR] {type(exc).__name__}: {exc}\n{tb}", flush=True)
+        logger.error("tariff_lookup: fetch failed for hs=%s: %s\n%s", hs, exc, tb)
         return _error_result(hs_code, origin, dest, f"Failed to reach HMRC API: {exc}")
 
     data = payload.get("data", {})

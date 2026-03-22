@@ -1,4 +1,5 @@
 from __future__ import annotations
+import logging
 from fastapi import APIRouter, Query, HTTPException, Response
 from app.core.responses import ok
 from app.schemas.models import DutyRateResponse
@@ -7,6 +8,8 @@ from app.services.uk_tariff_client import fetch_duty_rate as fetch_uk
 from app.services.eu_taric_client import fetch_duty_rate as fetch_eu
 from app.engines.tariff_lookup import lookup_commodity
 import json
+
+logger = logging.getLogger(__name__)
 
 
 router = APIRouter()
@@ -123,10 +126,27 @@ async def duty_rate_lookup(
     if len(hs) < 6:
         raise HTTPException(status_code=422, detail="hs_code must be at least 6 digits.")
 
-    result = await lookup_commodity(
-        hs_code=hs,
-        origin_country=origin_country,
-        destination_country=destination_country,
+    logger.info(
+        "duty_rate_lookup: hs=%s origin=%s dest=%s",
+        hs, origin_country.upper(), destination_country.upper(),
+    )
+    try:
+        result = await lookup_commodity(
+            hs_code=hs,
+            origin_country=origin_country,
+            destination_country=destination_country,
+        )
+    except Exception as exc:
+        import traceback, sys
+        tb = traceback.format_exc()
+        print(f"[duty_rate_lookup ERROR] {type(exc).__name__}: {exc}\n{tb}", file=sys.stderr, flush=True)
+        logger.exception("duty_rate_lookup: unhandled error hs=%s origin=%s dest=%s", hs, origin_country, destination_country)
+        raise
+
+    logger.info(
+        "duty_rate_lookup: result hs=%s duty_type=%s applicable_duty=%s vat=%s warnings=%d",
+        hs, result.get("duty_type"), result.get("applicable_duty_pct"),
+        result.get("vat_pct"), len(result.get("warnings", [])),
     )
     return ok(result)
 
