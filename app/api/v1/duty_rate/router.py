@@ -5,6 +5,7 @@ from app.schemas.models import DutyRateResponse
 from app.services import cache as cache_service
 from app.services.uk_tariff_client import fetch_duty_rate as fetch_uk
 from app.services.eu_taric_client import fetch_duty_rate as fetch_eu
+from app.engines.tariff_lookup import lookup_commodity
 import json
 
 
@@ -95,4 +96,37 @@ async def get_duty_rate(
     ).model_dump()
     cache_service.setex(cache_key, cache_service.TTL_24H, json.dumps(payload))
     return ok(payload)
+
+
+@router.get("/duty-rate/lookup", response_model=dict, summary="Live duty + VAT lookup from UK Trade Tariff")
+async def duty_rate_lookup(
+    hs_code: str = Query(..., description="HS commodity code (6–10 digits)"),
+    origin_country: str = Query(..., description="ISO-2 country of origin"),
+    destination_country: str = Query(..., description="ISO-2 destination country"),
+):
+    """
+    Fetch live duty and VAT data from the UK Trade Tariff API for a given
+    HS code, origin country, and destination.
+
+    Returns:
+    - **mfn_duty_pct**: standard third-country (MFN) duty %
+    - **preferential_duty_pct**: preferential rate if origin has a UK trade agreement
+    - **applicable_duty_pct**: the rate that actually applies (preferential if available, else MFN)
+    - **duty_type**: PREFERENTIAL | MFN | UNKNOWN
+    - **additional_duties**: any surcharges (e.g. Russia/Belarus +35%)
+    - **total_duty_pct**: applicable + additional duties combined
+    - **vat_pct**: VAT rate (typically 20% for GB imports)
+    - **controls**: suspensions or end-use reliefs available
+    - **warnings**: sanctions advisories, missing data notes
+    """
+    hs = "".join(ch for ch in hs_code if ch.isdigit())
+    if len(hs) < 6:
+        raise HTTPException(status_code=422, detail="hs_code must be at least 6 digits.")
+
+    result = await lookup_commodity(
+        hs_code=hs,
+        origin_country=origin_country,
+        destination_country=destination_country,
+    )
+    return ok(result)
 
