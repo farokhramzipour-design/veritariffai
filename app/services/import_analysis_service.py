@@ -62,13 +62,15 @@ async def analyze(request: ImportAnalysisRequest) -> ImportAnalysisResponse:
 
     hs_code = classification.primary_hs_code
 
-    # ── Steps 3, 4, 5: concurrent data fetches ───────────────────────────
-    tariff_data, vat_data, origin_rules = await asyncio.gather(
-        tariff_service.fetch(
-            hs_code=hs_code,
-            origin=request.origin_country,
-            destination=request.destination_country,
-        ),
+    # ── Step 3: Tariff data (needed by origin rules, so fetched first) ────
+    tariff_data = await tariff_service.fetch(
+        hs_code=hs_code,
+        origin=request.origin_country,
+        destination=request.destination_country,
+    )
+
+    # ── Steps 4 & 5: VAT + origin rules are independent — run concurrently ─
+    vat_data, origin_rules = await asyncio.gather(
         vat_service.fetch(
             destination=request.destination_country,
             hs_code=hs_code,
@@ -77,7 +79,7 @@ async def analyze(request: ImportAnalysisRequest) -> ImportAnalysisResponse:
             origin=request.origin_country,
             destination=request.destination_country,
             hs_code=hs_code,
-            duty_rate=tariff_data.duty_rate if hasattr(tariff_data, "duty_rate") else None,
+            duty_rate=tariff_data.duty_rate,
         ),
     )
 
