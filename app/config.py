@@ -37,6 +37,9 @@ class Settings(BaseSettings):
     # OpenAI
     openai_api_key: Optional[str] = None
     openai_model: str = "gpt-4"
+    # Import Analysis API
+    openai_classification_model: str = "gpt-4o"
+    import_analysis_confidence_threshold: float = 0.75
     
     # External Tariff APIs
     hmrc_api_key: Optional[str] = None

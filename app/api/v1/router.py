@@ -20,6 +20,9 @@ from app.api.v1.origin.router import router as origin_router
 from app.api.v1.compliance.router import router as compliance_router
 from app.api.v1.invoice.router import router as invoice_router
 from app.api.v1.workflow.router import router as workflow_router
+from app.api.v1.shipments.router import router as shipments_router
+from app.api.v1.workspace.router import router as workspace_router
+from app.api.v1.import_analysis.router import router as import_analysis_router
 
 
 # ── Public routes (no token required) ────────────────────────────────────────
@@ -44,6 +47,9 @@ _protected.include_router(origin_router, prefix="/origin", tags=["origin"])
 _protected.include_router(compliance_router, prefix="/compliance", tags=["compliance"])
 _protected.include_router(invoice_router, prefix="/invoice", tags=["invoice"])
 _protected.include_router(workflow_router, prefix="/workflow", tags=["workflow"])
+_protected.include_router(shipments_router, prefix="/shipments", tags=["shipments"])
+_protected.include_router(workspace_router, prefix="/workspace", tags=["workspace"])
+_protected.include_router(import_analysis_router, prefix="/import-analysis", tags=["import-analysis"])
 
 # ── Master router ─────────────────────────────────────────────────────────────
 api_router = APIRouter()

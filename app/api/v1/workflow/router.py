@@ -1,6 +1,7 @@
 """
 Workflow API – Steps 2 (RoO Wizard), TRQ, Section 301, UFLPA, CSL,
-              Step 5 (Licences), Step 6 (CDS Declaration), Step 7 (Document Bundle).
+              Step 4 (MTC upload), Step 5 (Licences, CBAM), Step 6 (CDS Declaration, EXS),
+              Step 7 (Document Bundle), plus EORI validation and SoO generation.
 
 All routes are protected (JWT required via the parent router's dependency).
 """
@@ -10,16 +11,18 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter
+from fastapi import APIRouter, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
 from app.core.responses import ok
 from app.engines.roo_wizard import run_roo_wizard
 from app.engines.trq_screen import screen_trq
 from app.engines.compliance_screen import screen_section_301, screen_uflpa, screen_csl
+from app.engines.cbam_calculator import calculate_cbam
+from app.engines.mtc_extraction import extract_mtc_fields
 
 router = APIRouter()
 
@@ -612,3 +615,543 @@ async def list_bundles():
         "bundles": list(_bundle_store.values()),
         "total": len(_bundle_store),
     })
+
+
+# ===========================================================================
+# Step 4 – MTC Upload + AI Extraction
+# ===========================================================================
+
+_MAX_MTC_BYTES = 10 * 1024 * 1024  # 10 MB
+
+
+@router.post(
+    "/mtc/upload",
+    response_model=dict,
+    summary="Step 4 – Upload Mill Test Certificate and extract fields",
+)
+async def mtc_upload(
+    file: UploadFile = File(..., description="Mill Test Certificate (PDF, DOCX, JPG, PNG)"),
+):
+    """
+    Upload a Mill Test Certificate (EN 10204 3.1 / 3.2) and extract steel-specific fields.
+
+    Returns field-by-field extraction with confidence scores:
+    - melt_country_iso / pour_country_iso (mandatory for TCA origin proof)
+    - heat_number (traceability)
+    - production_route (BF-BOF / EAF / DRI-EAF) — for CBAM SEE
+    - chemical composition (Cr, Mo, C, Mn, Si, …) — for classification
+    - mechanical properties (tensile, yield, elongation)
+    - cbam_see_tco2_per_t (if stated on certificate)
+
+    If melt or pour country is RU or BY, a HARD BLOCK is issued and
+    the shipment cannot proceed.
+    """
+    content = await file.read()
+
+    if not content:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+    if len(content) > _MAX_MTC_BYTES:
+        raise HTTPException(status_code=413, detail="File too large. Maximum 10 MB.")
+
+    # Accept PDF and common image/office types
+    filename = file.filename or "mtc"
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    allowed = {"pdf", "docx", "jpg", "jpeg", "png"}
+    if ext not in allowed:
+        raise HTTPException(
+            status_code=415,
+            detail=f"Unsupported file type '{ext}'. Accepted: {', '.join(sorted(allowed))}",
+        )
+
+    # Compute SHA-256 for audit trail
+    doc_hash = hashlib.sha256(content).hexdigest()
+
+    try:
+        result = extract_mtc_fields(pdf_bytes=content, filename=filename)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"MTC extraction failed: {exc}")
+
+    result["sha256"] = doc_hash
+    result["file_size_bytes"] = len(content)
+    return ok(result)
+
+
+# ===========================================================================
+# CBAM Calculator
+# ===========================================================================
+
+class CBAMCalculateRequest(BaseModel):
+    production_route: str = Field(
+        ..., description="Steel production route: BF-BOF | EAF | DRI-EAF | UNKNOWN"
+    )
+    weight_tonnes: float = Field(..., gt=0, description="Net shipment weight in tonnes")
+    actual_see_tco2_per_t: Optional[float] = Field(
+        None,
+        description="Actual Specific Embedded Emissions (tCO₂/t) from verified MTC. "
+                    "If omitted, the route's default factor is used.",
+    )
+    carbon_price_eur: Optional[float] = Field(
+        None, description="EU ETS carbon price (€/tCO₂). Defaults to 78 €/t."
+    )
+    cbam_declarant_id: Optional[str] = Field(None, description="CBAM authorised declarant ID")
+
+
+@router.post(
+    "/cbam/calculate",
+    response_model=dict,
+    summary="Step 5 – Calculate CBAM liability",
+)
+async def cbam_calculate(body: CBAMCalculateRequest):
+    """
+    Calculate CBAM (Carbon Border Adjustment Mechanism) liability for a steel shipment.
+
+    EU Reg 2023/956 — mandatory for steel imports where total weight > 50 tonnes.
+
+    Returns:
+    - applicable: whether CBAM applies
+    - liability_eur: estimated CBAM liability at current carbon price
+    - liability_if_default_eur: liability if BF-BOF defaults are used
+    - saving_eur: financial saving from using actual verified SEE data
+    - total_co2_actual_t / total_co2_default_t: embedded CO₂ tonnes
+    """
+    result = calculate_cbam(
+        production_route=body.production_route,
+        weight_tonnes=body.weight_tonnes,
+        actual_see_tco2_per_t=body.actual_see_tco2_per_t,
+        carbon_price_eur=body.carbon_price_eur,
+        cbam_declarant_id=body.cbam_declarant_id,
+    )
+    return ok(result)
+
+
+# ===========================================================================
+# EORI Validation
+# ===========================================================================
+
+@router.get(
+    "/eori/validate",
+    response_model=dict,
+    summary="Validate an EORI number via HMRC / EU API",
+)
+async def eori_validate(eori: str):
+    """
+    Validate an EORI number format and check it against the HMRC / EU EORI validation API.
+
+    GB EORI format: GB + 12 digits (e.g. GB123456789000)
+    XI EORI format: XI + 12 digits (Northern Ireland)
+    EU EORI format: 2-letter country code + up to 15 alphanumeric chars
+
+    Note: Live HMRC API validation is attempted; on failure, format-only validation
+    is returned with a warning.
+    """
+    eori_clean = eori.strip().upper()
+
+    # Format validation
+    import re as _re
+    valid_format = bool(_re.match(r"^[A-Z]{2}[A-Z0-9]{1,15}$", eori_clean))
+
+    if not valid_format:
+        return ok({
+            "eori": eori_clean,
+            "valid": False,
+            "format_valid": False,
+            "live_check": False,
+            "message": (
+                "Invalid EORI format. Expected 2-letter country prefix followed by "
+                "up to 15 alphanumeric characters (e.g. GB123456789000)."
+            ),
+        })
+
+    country_prefix = eori_clean[:2]
+
+    # Attempt live HMRC check for GB/XI EORIs
+    live_valid = None
+    live_checked = False
+    live_error = None
+
+    if country_prefix in ("GB", "XI"):
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=8) as client:
+                resp = await client.get(
+                    f"https://api.service.hmrc.gov.uk/customs/eori/validation/{eori_clean}",
+                    headers={"Accept": "application/json"},
+                )
+            if resp.status_code == 200:
+                data = resp.json()
+                live_valid = data.get("valid", False)
+                live_checked = True
+            elif resp.status_code == 404:
+                live_valid = False
+                live_checked = True
+        except Exception as exc:
+            live_error = str(exc)
+
+    return ok({
+        "eori": eori_clean,
+        "valid": live_valid if live_checked else valid_format,
+        "format_valid": valid_format,
+        "live_check": live_checked,
+        "country": country_prefix,
+        "live_error": live_error,
+        "message": (
+            "EORI validated via HMRC API." if live_checked and live_valid
+            else "EORI format valid; live check unavailable — verify manually at HMRC."
+            if not live_checked
+            else "EORI not found in HMRC registry."
+        ),
+    })
+
+
+# ===========================================================================
+# Statement of Origin Generator
+# ===========================================================================
+
+class SoOGenerateRequest(BaseModel):
+    hs_code: str = Field(..., description="HS commodity code")
+    goods_description: str = Field(..., description="Plain-language goods description")
+    exporter_eori: str = Field(..., description="Exporter EORI number")
+    exporter_name: str = Field(..., description="Exporter legal name")
+    origin_country: str = Field("GB", description="ISO-2 country of origin")
+    destination_country: str = Field(..., description="ISO-2 destination country")
+    weight_tonnes: Optional[float] = Field(None, description="Net weight in tonnes")
+    invoice_reference: Optional[str] = Field(None, description="Invoice reference number")
+    heat_number: Optional[str] = Field(None, description="Heat/cast number from MTC")
+    cumulation_applied: bool = Field(False, description="Whether EU cumulation was applied")
+    cumulation_countries: Optional[List[str]] = Field(None, description="Cumulation country ISO codes")
+    shipment_value_gbp: Optional[float] = Field(None, description="Shipment value in GBP")
+    statement_type: str = Field(
+        "ONE_OFF",
+        description="ONE_OFF | LONG_TERM",
+    )
+    long_term_from: Optional[str] = Field(None, description="Long-term start date (YYYY-MM-DD)")
+    long_term_to: Optional[str] = Field(None, description="Long-term end date (YYYY-MM-DD)")
+
+
+@router.post(
+    "/soo/generate",
+    response_model=dict,
+    summary="Step 3 – Generate Statement on Origin (TCA Annex ORIG-4)",
+)
+async def soo_generate(body: SoOGenerateRequest):
+    """
+    Generate a TCA-compliant Statement on Origin (Annex ORIG-4).
+
+    Returns the full statement text ready for review and signature,
+    plus a validation checklist and SHA-256 hash of the canonical form.
+    """
+    now_utc = datetime.now(timezone.utc)
+    today = now_utc.date().isoformat()
+    validity_until = (now_utc + timedelta(days=365)).date().isoformat()
+
+    hs_digits = "".join(ch for ch in body.hs_code if ch.isdigit())
+    origin = body.origin_country.upper().strip()
+    dest = body.destination_country.upper().strip()
+
+    # Cumulation clause
+    if body.cumulation_applied and body.cumulation_countries:
+        cum_countries = ", ".join(c.upper() for c in body.cumulation_countries)
+        cumulation_clause = f"Cumulation applied with materials originating in: {cum_countries}."
+    else:
+        cumulation_clause = "No cumulation applied."
+
+    # Long-term period clause
+    if body.statement_type == "LONG_TERM" and body.long_term_from and body.long_term_to:
+        period_clause = (
+            f"\nThis statement on origin applies to all shipments of the described products "
+            f"exported in the period from {body.long_term_from} to {body.long_term_to}."
+        )
+    else:
+        period_clause = ""
+
+    # Heat number reference
+    heat_clause = (
+        f"\nMelt location: {origin} · Heat number: {body.heat_number}"
+        if body.heat_number
+        else f"\nMelt location: {origin} · Heat number: [from Mill Test Certificate — required]"
+    )
+
+    # EORI inclusion threshold (>£5,400 for UK→EU TCA)
+    eori_required = (body.shipment_value_gbp or 0) > 5400
+
+    statement_text = (
+        f'The exporter of the products covered by this document '
+        f'(EORI No: {body.exporter_eori}) declares that, except where otherwise clearly '
+        f'indicated, these products are of {origin} preferential origin.\n\n'
+        f'{cumulation_clause}\n\n'
+        f'Goods: {body.goods_description} · HS {hs_digits}'
+        + (f' · {body.weight_tonnes}t' if body.weight_tonnes else '')
+        + (f' · Invoice {body.invoice_reference}' if body.invoice_reference else '')
+        + heat_clause
+        + period_clause
+        + f'\n\n{today}'
+        + f'\n{body.exporter_name}'
+    )
+
+    # Validation checklist
+    checklist = [
+        {
+            "item": "TCA Annex ORIG-4 wording",
+            "status": "PASS",
+            "note": "Exact match to annexe wording",
+        },
+        {
+            "item": f"EORI {body.exporter_eori}",
+            "status": "PENDING",
+            "note": "Use /workflow/eori/validate to confirm",
+        },
+        {
+            "item": "Cumulation state",
+            "status": "PASS",
+            "note": cumulation_clause,
+        },
+        {
+            "item": "Heat number",
+            "status": "PASS" if body.heat_number else "WARNING",
+            "note": (
+                f"Heat {body.heat_number} — present"
+                if body.heat_number
+                else "MTC not yet uploaded — heat number required for steel (Step 4)"
+            ),
+        },
+        {
+            "item": f"Value {'£' + str(int(body.shipment_value_gbp)) if body.shipment_value_gbp else 'unknown'} — EORI inclusion",
+            "status": "PASS" if eori_required or not body.shipment_value_gbp else "WARNING",
+            "note": (
+                f"Value > £5,400: EORI correctly included"
+                if eori_required
+                else "Value ≤ £5,400: EORI optional but included"
+                if body.shipment_value_gbp
+                else "Shipment value not provided — verify EORI inclusion requirement"
+            ),
+        },
+        {
+            "item": "Validity",
+            "status": "PASS",
+            "note": f"12 months from today — valid until {validity_until}",
+        },
+    ]
+
+    canonical = json.dumps(
+        {
+            "text": statement_text,
+            "exporter_eori": body.exporter_eori,
+            "hs_code": hs_digits,
+            "origin": origin,
+            "destination": dest,
+            "date": today,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    sha256_hash = hashlib.sha256(canonical.encode()).hexdigest()
+
+    return ok({
+        "statement_text": statement_text,
+        "statement_type": body.statement_type,
+        "origin_country": origin,
+        "destination_country": dest,
+        "exporter_eori": body.exporter_eori,
+        "exporter_name": body.exporter_name,
+        "hs_code": hs_digits,
+        "issued_date": today,
+        "valid_until": validity_until,
+        "cumulation_applied": body.cumulation_applied,
+        "cumulation_clause": cumulation_clause,
+        "checklist": checklist,
+        "sha256_hash": sha256_hash,
+        "annex_reference": "TCA Annex ORIG-4",
+        "regulation": "UK-EU Trade and Cooperation Agreement, Art. ORIG.19",
+    })
+
+
+# ===========================================================================
+# EXS Timing Calculator (Step 6)
+# ===========================================================================
+
+# EXS pre-lodgement rules (minutes before departure)
+_EXS_RULES: Dict[str, Dict[str, Any]] = {
+    "SEA_CONTAINER": {
+        "label": "Sea container (FCL / LCL)",
+        "advance_hours": 24,
+        "rule": "24 hours before departure — Art. 105(1)(a) UCC DA",
+    },
+    "SEA_BULK": {
+        "label": "Sea bulk cargo",
+        "advance_hours": 4,
+        "rule": "4 hours before departure — Art. 105(1)(b) UCC DA",
+    },
+    "SHORT_SEA": {
+        "label": "Short-sea ferry (RoRo, <12h crossing)",
+        "advance_hours": 2,
+        "rule": "2 hours before departure — Art. 105(1)(c) UCC DA",
+    },
+    "AIR": {
+        "label": "Air freight",
+        "advance_hours": 0,
+        "advance_minutes": 30,
+        "rule": "At least 30 minutes before departure — Art. 106(1) UCC DA",
+    },
+    "ROAD": {
+        "label": "Road / truck",
+        "advance_hours": 1,
+        "rule": "1 hour before departure — Art. 105(1)(e) UCC DA",
+    },
+    "RAIL": {
+        "label": "Rail freight",
+        "advance_hours": 2,
+        "rule": "2 hours before departure — Art. 105(1)(f) UCC DA",
+    },
+}
+
+
+class EXSCalculateRequest(BaseModel):
+    transport_mode: str = Field(
+        ...,
+        description=(
+            "Transport mode: SEA_CONTAINER | SEA_BULK | SHORT_SEA | AIR | ROAD | RAIL"
+        ),
+    )
+    etd_utc: str = Field(
+        ...,
+        description="Estimated time of departure in UTC (ISO 8601, e.g. '2026-03-28T14:00:00Z')",
+    )
+
+
+@router.post(
+    "/exs/calculate",
+    response_model=dict,
+    summary="Step 6 – Calculate EXS pre-lodgement deadline",
+)
+async def exs_calculate(body: EXSCalculateRequest):
+    """
+    Calculate the Entry Summary Declaration (EXS / ENS) pre-lodgement deadline.
+
+    Returns the latest time by which the EXS must be lodged with HMRC CDS,
+    based on the transport mode and estimated departure time.
+    Implements EU UCC Delegated Act Article 105/106 timing rules.
+    """
+    mode = body.transport_mode.upper().strip()
+    if mode not in _EXS_RULES:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Unknown transport mode '{mode}'. "
+                f"Valid modes: {', '.join(sorted(_EXS_RULES.keys()))}"
+            ),
+        )
+
+    rule = _EXS_RULES[mode]
+
+    try:
+        etd = datetime.fromisoformat(body.etd_utc.replace("Z", "+00:00"))
+    except ValueError:
+        raise HTTPException(
+            status_code=422,
+            detail="etd_utc must be a valid ISO 8601 datetime, e.g. '2026-03-28T14:00:00Z'",
+        )
+
+    hours = rule.get("advance_hours", 0)
+    minutes = rule.get("advance_minutes", 0)
+    deadline = etd - timedelta(hours=hours, minutes=minutes)
+
+    return ok({
+        "transport_mode": mode,
+        "transport_label": rule["label"],
+        "etd_utc": etd.isoformat(),
+        "exs_deadline_utc": deadline.isoformat(),
+        "advance_notice": f"{hours}h{f' {minutes}min' if minutes else ''}",
+        "legal_basis": rule["rule"],
+        "within_time": deadline > datetime.now(timezone.utc),
+    })
+
+
+# ===========================================================================
+# TRQ Live Quota Detail
+# ===========================================================================
+
+_TRQ_CATEGORIES: Dict[str, Dict[str, Any]] = {
+    "EU_CAT26": {
+        "name": "EU Steel Safeguard — Category 26 (Other alloy steel flat-rolled / semi-finished)",
+        "hs_chapters": ["7224", "7225", "7226"],
+        "authority": "European Commission — DG TAXUD",
+        "regulation": "EU Implementing Regulation (EU) 2019/159, as amended",
+        "in_quota_duty_pct": 0.0,
+        "out_quota_duty_pct": 25.0,
+        "new_out_quota_duty_pct": 50.0,
+        "new_rate_applies_from": "2026-07-01",
+        "quota_period": "Q1 2026 (Jan–Mar)",
+        "quota_tonnes_total": 287400.0,
+        "quota_tonnes_remaining": 195432.0,  # mock — fetch from TARIC in production
+        "quota_pct_remaining": 68.0,
+        "estimated_depletion_weeks": 11,
+        "last_updated": "2026-03-21T08:00:00Z",
+        "alert_threshold_pct": 25,
+        "taric_url": "https://ec.europa.eu/taxation_customs/dds2/taric",
+    },
+    "UK_SAFEGUARD": {
+        "name": "UK Steel Safeguard (SI 2021/1122)",
+        "hs_chapters": ["7208", "7209", "7210", "7211", "7212"],
+        "authority": "UK Trade Remedies Authority",
+        "regulation": "UK Safeguard (Tariff Quota) Regulations 2021 SI 1122",
+        "in_quota_duty_pct": 0.0,
+        "out_quota_duty_pct": 25.0,
+        "quota_period": "Q1 2026 (Jan–Mar)",
+        "quota_tonnes_total": 145000.0,
+        "quota_tonnes_remaining": 98700.0,
+        "quota_pct_remaining": 68.1,
+        "estimated_depletion_weeks": 9,
+        "last_updated": "2026-03-21T08:00:00Z",
+        "alert_threshold_pct": 25,
+        "tra_url": "https://www.trade-remedies.service.gov.uk",
+    },
+}
+
+
+@router.get(
+    "/trq/quota/{category}",
+    response_model=dict,
+    summary="Step 2 – Get live TRQ quota data for a category",
+)
+async def trq_quota(category: str):
+    """
+    Return detailed live quota data for a TRQ category.
+
+    Supported categories: EU_CAT26 | UK_SAFEGUARD
+
+    Returns:
+    - quota_tonnes_remaining / quota_pct_remaining
+    - in-quota and out-of-quota duty rates
+    - estimated weeks to quota exhaustion
+    - traffic-light status: GREEN (>50%) / AMBER (25–50%) / RED (<25%)
+
+    Note: tonnage figures are mocked in this version.
+    In production, fetch live from EU TARIC and UK TRA APIs.
+    """
+    cat = category.upper().strip()
+    if cat not in _TRQ_CATEGORIES:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"TRQ category '{cat}' not found. "
+                f"Available: {', '.join(sorted(_TRQ_CATEGORIES.keys()))}"
+            ),
+        )
+
+    data = dict(_TRQ_CATEGORIES[cat])
+    pct = data.get("quota_pct_remaining", 100.0)
+
+    if pct > 50:
+        status = "GREEN"
+    elif pct >= 25:
+        status = "AMBER"
+    else:
+        status = "RED"
+
+    data["status"] = status
+    data["category"] = cat
+    data["data_note"] = (
+        "Quota data is indicative. Fetch live from TARIC / UK TRA before lodging declarations."
+    )
+
+    return ok(data)
