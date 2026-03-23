@@ -202,12 +202,9 @@ async def classify_hs_code(
             text={
                 "format": {
                     "type": "json_schema",
-                    # SDK v2.x: schema fields are nested under "json_schema", not flat
-                    "json_schema": {
-                        "name": "hs_classification_result",
-                        "strict": True,
-                        "schema": _HS_CLASSIFICATION_SCHEMA,
-                    },
+                    "name": "hs_classification_result",
+                    "strict": True,
+                    "schema": _HS_CLASSIFICATION_SCHEMA,
                 }
             },
         )
