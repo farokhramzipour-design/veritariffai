@@ -15,9 +15,12 @@ Accepts product details and trade lane information, returns:
 from __future__ import annotations
 
 import logging
+import sys
+import traceback
 
 from fastapi import APIRouter, HTTPException
 
+from app.config import settings
 from app.core.responses import ok
 from app.schemas.import_analysis import ImportAnalysisRequest, ImportAnalysisResponse
 from app.services import import_analysis_service
@@ -77,14 +80,32 @@ async def import_analysis(request: ImportAnalysisRequest) -> ImportAnalysisRespo
         result = await import_analysis_service.analyze(request)
     except RuntimeError as exc:
         # Configuration errors (e.g. missing API key)
-        logger.error("import_analysis: config error: %s", exc)
+        tb = traceback.format_exc()
+        print(f"[import_analysis 503] {type(exc).__name__}: {exc}\n{tb}", file=sys.stderr, flush=True)
+        logger.error("import_analysis: config error: %s", exc, exc_info=True)
         raise HTTPException(status_code=503, detail=str(exc))
     except ValueError as exc:
         # Malformed AI output or validation errors
-        logger.error("import_analysis: validation error: %s", exc)
+        tb = traceback.format_exc()
+        print(f"[import_analysis 422] {type(exc).__name__}: {exc}\n{tb}", file=sys.stderr, flush=True)
+        logger.error("import_analysis: validation error: %s", exc, exc_info=True)
         raise HTTPException(status_code=422, detail=str(exc))
     except Exception as exc:
-        logger.exception("import_analysis: unhandled error: %s", exc)
-        raise HTTPException(status_code=500, detail="Import analysis failed. See server logs.")
+        tb = traceback.format_exc()
+        print(f"[import_analysis 500] {type(exc).__name__}: {exc}\n{tb}", file=sys.stderr, flush=True)
+        logger.error(
+            "import_analysis: unhandled %s: %s\n%s",
+            type(exc).__name__, exc, tb,
+        )
+        detail: str | dict
+        if settings.debug or settings.environment != "production":
+            detail = {
+                "error": type(exc).__name__,
+                "message": str(exc),
+                "traceback": tb.splitlines()[-5:],   # last 5 lines
+            }
+        else:
+            detail = "Import analysis failed. See server logs."
+        raise HTTPException(status_code=500, detail=detail)
 
     return result
