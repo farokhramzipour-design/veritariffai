@@ -23,6 +23,7 @@ from app.api.v1.workflow.router import router as workflow_router
 from app.api.v1.shipments.router import router as shipments_router
 from app.api.v1.workspace.router import router as workspace_router
 from app.api.v1.import_analysis.router import router as import_analysis_router
+from app.api.v1.analytics.router import router as analytics_router
 
 
 # ── Public routes (no token required) ────────────────────────────────────────
@@ -50,6 +51,7 @@ _protected.include_router(workflow_router, prefix="/workflow", tags=["workflow"]
 _protected.include_router(shipments_router, prefix="/shipments", tags=["shipments"])
 _protected.include_router(workspace_router, prefix="/workspace", tags=["workspace"])
 _protected.include_router(import_analysis_router, prefix="/import-analysis", tags=["import-analysis"])
+_protected.include_router(analytics_router, prefix="/analytics", tags=["analytics"])
 
 # ── Master router ─────────────────────────────────────────────────────────────
 api_router = APIRouter()
