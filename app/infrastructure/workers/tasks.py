@@ -81,12 +81,13 @@ def ingest_taric_xlsx_from_url(kind: str, url: str):
 
     async def _run():
         async with AsyncSessionMaker() as db:
-            run = IngestionRun(source="TARIC", status="running", started_at=datetime.utcnow())
-            db.add(run)
-            await db.commit()
-            await db.refresh(run)
-
+            run: IngestionRun | None = None
             try:
+                run = IngestionRun(source="TARIC", status="running", started_at=datetime.utcnow())
+                db.add(run)
+                await db.commit()
+                await db.refresh(run)
+
                 data = await _download_bytes(url, max_bytes=80 * 1024 * 1024)
                 k = (kind or "").strip().lower()
                 if k == "duties_import":
@@ -96,17 +97,19 @@ def ingest_taric_xlsx_from_url(kind: str, url: str):
                 else:
                     raise ValueError("Unknown kind")
 
-                run.status = "success"
-                run.records_processed = int(result.get("measures_upserted") or result.get("hs_codes_upserted") or 0)
-                run.completed_at = datetime.utcnow()
-                await db.commit()
+                if run is not None:
+                    run.status = "success"
+                    run.records_processed = int(result.get("measures_upserted") or result.get("hs_codes_upserted") or 0)
+                    run.completed_at = datetime.utcnow()
+                    await db.commit()
                 return {"accepted": True, "kind": k, "result": result}
             except Exception as exc:
                 await db.rollback()
-                run.status = "failed"
-                run.error_details = str(exc)
-                run.completed_at = datetime.utcnow()
-                await db.commit()
+                if run is not None:
+                    run.status = "failed"
+                    run.error_details = str(exc)
+                    run.completed_at = datetime.utcnow()
+                    await db.commit()
                 return {"accepted": False, "kind": kind, "error": str(exc)}
 
     return asyncio.run(_run())
