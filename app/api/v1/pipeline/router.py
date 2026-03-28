@@ -4,13 +4,12 @@ from fastapi import APIRouter, Depends, Path, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.deps import require_admin_key
 from app.core.responses import ok
 from app.infrastructure.database.models import IngestionRun
 from app.infrastructure.database.session import get_session
 
 
-router = APIRouter(dependencies=[Depends(require_admin_key)])
+router = APIRouter()
 
 
 @router.get("/status")
@@ -80,4 +79,3 @@ async def pipeline_logs(
         }
         for r in runs
     ])
-
