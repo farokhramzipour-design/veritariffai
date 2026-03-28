@@ -64,12 +64,19 @@ def _first_text(elem, names: tuple[str, ...]) -> str | None:
 
 
 async def _download_taric_xml(*, params: dict[str, str]) -> str:
-    backoff_s = 0.5
+    backoff_s = 0.75
     last_exc: Exception | None = None
-    for _ in range(3):
+    for _ in range(5):
         try:
-            async with httpx.AsyncClient(timeout=300) as client:
-                resp = await client.get(_TARIC_URL, params=params, headers={"Accept": "*/*"})
+            async with httpx.AsyncClient(timeout=300, follow_redirects=True) as client:
+                resp = await client.get(
+                    _TARIC_URL,
+                    params=params,
+                    headers={
+                        "Accept": "application/xml,text/xml,*/*",
+                        "User-Agent": "veritariffai/1.0",
+                    },
+                )
                 resp.raise_for_status()
                 content = resp.content
             is_gzip = content[:2] == b"\x1f\x8b"
@@ -77,9 +84,13 @@ async def _download_taric_xml(*, params: dict[str, str]) -> str:
             os.close(fd)
             if is_gzip:
                 xml_bytes = gzip.decompress(content)
+                if len(xml_bytes) < 10_000:
+                    raise ValueError("TARIC download returned an unexpectedly small response")
                 with open(path, "wb") as f:
                     f.write(xml_bytes)
             else:
+                if len(content) < 10_000:
+                    raise ValueError("TARIC download returned an unexpectedly small response")
                 with open(path, "wb") as f:
                     f.write(content)
             return path

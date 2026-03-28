@@ -403,55 +403,71 @@ async def _ingest_full(max_commodities: int | None) -> dict[str, Any]:
                     s_data = section_detail.get("data") if isinstance(section_detail.get("data"), dict) else {}
                     s_rels = s_data.get("relationships") if isinstance(s_data.get("relationships"), dict) else {}
                     chapters_rel = s_rels.get("chapters") if isinstance(s_rels.get("chapters"), dict) else {}
-                    chapter_ids = chapters_rel.get("data") if isinstance(chapters_rel.get("data"), list) else []
-                    chapter_ids_norm = [c.get("id") for c in chapter_ids if isinstance(c, dict) and isinstance(c.get("id"), str)]
+                    chapters_link = (chapters_rel.get("links") if isinstance(chapters_rel.get("links"), dict) else {}).get("related")
 
-                    for chapter_id in chapter_ids_norm:
-                        chapter_detail = await _get_json_with_retries(
-                            client,
-                            f"{_API_V2}/chapters/{chapter_id}",
-                            headers={"Accept": "application/vnd.hmrc.2.0+json"},
-                        )
-                        c_data = chapter_detail.get("data") if isinstance(chapter_detail.get("data"), dict) else {}
-                        c_rels = c_data.get("relationships") if isinstance(c_data.get("relationships"), dict) else {}
+                    if isinstance(chapters_link, str) and chapters_link:
+                        chapter_items = await _fetch_all_pages(client, chapters_link)
+                    else:
+                        chapter_ids = chapters_rel.get("data") if isinstance(chapters_rel.get("data"), list) else []
+                        chapter_ids_norm = [c.get("id") for c in chapter_ids if isinstance(c, dict) and isinstance(c.get("id"), str)]
+                        chapter_items = [{"id": cid} for cid in chapter_ids_norm]
+
+                    for chapter in chapter_items:
+                        chapter_id = chapter.get("id")
+                        if not isinstance(chapter_id, str) or not chapter_id:
+                            continue
+                        c_rels = chapter.get("relationships") if isinstance(chapter.get("relationships"), dict) else {}
                         headings_rel = c_rels.get("headings") if isinstance(c_rels.get("headings"), dict) else {}
-                        heading_ids = headings_rel.get("data") if isinstance(headings_rel.get("data"), list) else []
-                        heading_ids_norm = [h.get("id") for h in heading_ids if isinstance(h, dict) and isinstance(h.get("id"), str)]
+                        headings_link = (headings_rel.get("links") if isinstance(headings_rel.get("links"), dict) else {}).get("related")
 
-                        for heading_id in heading_ids_norm:
-                            heading_detail = await _get_json_with_retries(
+                        if not (isinstance(headings_link, str) and headings_link):
+                            chapter_detail = await _get_json_with_retries(
                                 client,
-                                f"{_API_V2}/headings/{heading_id}",
+                                f"{_API_V2}/chapters/{chapter_id}",
                                 headers={"Accept": "application/vnd.hmrc.2.0+json"},
                             )
-                            included = heading_detail.get("included") if isinstance(heading_detail.get("included"), list) else []
-                            commodity_codes: list[str] = []
-                            for obj in included:
-                                if not isinstance(obj, dict):
-                                    continue
-                                if obj.get("type") not in {"commodity", "commodities"}:
-                                    continue
-                                attrs = obj.get("attributes") if isinstance(obj.get("attributes"), dict) else {}
+                            c_data = chapter_detail.get("data") if isinstance(chapter_detail.get("data"), dict) else {}
+                            c_rels = c_data.get("relationships") if isinstance(c_data.get("relationships"), dict) else {}
+                            headings_rel = c_rels.get("headings") if isinstance(c_rels.get("headings"), dict) else {}
+                            headings_link = (headings_rel.get("links") if isinstance(headings_rel.get("links"), dict) else {}).get("related")
+
+                        if isinstance(headings_link, str) and headings_link:
+                            heading_items = await _fetch_all_pages(client, headings_link)
+                        else:
+                            heading_items = []
+
+                        for heading in heading_items:
+                            heading_id = heading.get("id")
+                            if not isinstance(heading_id, str) or not heading_id:
+                                continue
+
+                            h_rels = heading.get("relationships") if isinstance(heading.get("relationships"), dict) else {}
+                            comm_rel = h_rels.get("commodities") if isinstance(h_rels.get("commodities"), dict) else {}
+                            comm_link = (comm_rel.get("links") if isinstance(comm_rel.get("links"), dict) else {}).get("related")
+
+                            commodity_items: list[dict[str, Any]] = []
+                            if isinstance(comm_link, str) and comm_link:
+                                commodity_items = await _fetch_all_pages(client, comm_link)
+                            else:
+                                heading_detail = await _get_json_with_retries(
+                                    client,
+                                    f"{_API_V2}/headings/{heading_id}",
+                                    headers={"Accept": "application/vnd.hmrc.2.0+json"},
+                                )
+                                included = heading_detail.get("included") if isinstance(heading_detail.get("included"), list) else []
+                                commodity_items = [c for c in included if isinstance(c, dict)]
+
+                            for commodity in commodity_items:
+                                attrs = commodity.get("attributes") if isinstance(commodity.get("attributes"), dict) else {}
                                 if str(attrs.get("productline_suffix") or "") != "80":
                                     continue
-                                code = attrs.get("goods_nomenclature_item_id") or obj.get("id")
-                                if isinstance(code, str):
-                                    hs = _digits(code)
-                                    if hs and len(hs) >= 6:
-                                        commodity_codes.append(hs)
+                                code = attrs.get("goods_nomenclature_item_id") or commodity.get("id")
+                                if not isinstance(code, str):
+                                    continue
+                                hs = _digits(code)
+                                if len(hs) < 6:
+                                    continue
 
-                            if not commodity_codes:
-                                h_data = heading_detail.get("data") if isinstance(heading_detail.get("data"), dict) else {}
-                                h_rels = h_data.get("relationships") if isinstance(h_data.get("relationships"), dict) else {}
-                                comm_rel = h_rels.get("commodities") if isinstance(h_rels.get("commodities"), dict) else {}
-                                comm_ids = comm_rel.get("data") if isinstance(comm_rel.get("data"), list) else []
-                                for c in comm_ids:
-                                    if isinstance(c, dict) and isinstance(c.get("id"), str):
-                                        hs = _digits(c["id"])
-                                        if hs and len(hs) >= 6:
-                                            commodity_codes.append(hs)
-
-                            for hs in commodity_codes:
                                 counts = await _ingest_commodity(db, client, hs)
                                 commodities_ingested += counts["commodities"]
                                 measures_upserted += counts["measures"]
