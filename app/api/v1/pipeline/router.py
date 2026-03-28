@@ -54,7 +54,7 @@ async def pipeline_status(db: AsyncSession = Depends(get_session)):
 
 @router.post("/trigger/{source}")
 async def trigger_pipeline(
-    source: str = Path(..., description="uk_tariff | eu_taric | eu_vat"),
+    source: str = Path(..., description="uk_tariff | uk_tariff_full | eu_taric | eu_taric_full | eu_vat"),
     mode: str = Query("async", description="async | sync"),
     hs_codes: str | None = Query(None, description="Comma-separated HS codes for sync TARIC/UK runs"),
 ):
@@ -66,12 +66,17 @@ async def trigger_pipeline(
         if source == "eu_vat":
             from app.infrastructure.ingestion.eu_vat import ingest as ingest_eu_vat
             return ok({"accepted": True, "mode": "sync", "source": source, "result": await asyncio.wait_for(ingest_eu_vat(), timeout=120)})
-        if source == "eu_taric":
+        if source in {"eu_taric", "eu_taric_full"}:
             from app.infrastructure.ingestion.taric import ingest_delta as ingest_taric
-            with _temp_env("EU_TARIC_HS_CODES", hs_codes_val or None):
-                return ok({"accepted": True, "mode": "sync", "source": source, "result": await asyncio.wait_for(ingest_taric(), timeout=180)})
-        if source == "uk_tariff":
+            if source == "eu_taric_full":
+                from app.infrastructure.ingestion.taric import ingest_full as ingest_taric_full
+                return ok({"accepted": True, "mode": "sync", "source": source, "result": await asyncio.wait_for(ingest_taric_full(), timeout=900)})
+            return ok({"accepted": True, "mode": "sync", "source": source, "result": await asyncio.wait_for(ingest_taric(), timeout=300)})
+        if source in {"uk_tariff", "uk_tariff_full"}:
             from app.infrastructure.ingestion.ukgt import ingest_delta as ingest_ukgt
+            if source == "uk_tariff_full":
+                from app.infrastructure.ingestion.ukgt import ingest_full as ingest_ukgt_full
+                return ok({"accepted": True, "mode": "sync", "source": source, "result": await asyncio.wait_for(ingest_ukgt_full(), timeout=3600)})
             with _temp_env("UK_TARIFF_HS_CODES", hs_codes_val or None):
                 return ok({"accepted": True, "mode": "sync", "source": source, "result": await asyncio.wait_for(ingest_ukgt(), timeout=240)})
         return ok({"accepted": False, "error": "Unknown source"})
@@ -79,8 +84,12 @@ async def trigger_pipeline(
     from app.infrastructure.workers.celery_app import celery_app
     if source == "uk_tariff":
         task = "app.infrastructure.workers.tasks.ingest_ukgt_delta"
+    elif source == "uk_tariff_full":
+        task = "app.infrastructure.workers.tasks.ingest_ukgt_full"
     elif source == "eu_taric":
         task = "app.infrastructure.workers.tasks.ingest_taric_delta"
+    elif source == "eu_taric_full":
+        task = "app.infrastructure.workers.tasks.ingest_taric_full"
     elif source == "eu_vat":
         task = "app.infrastructure.workers.tasks.ingest_eu_vat"
     else:

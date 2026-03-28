@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import os
-import re
+import tempfile
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 from uuid import uuid4
+from xml.etree.ElementTree import iterparse
 
 import httpx
 import sqlalchemy as sa
@@ -17,125 +19,145 @@ from app.infrastructure.database.models import HSCode, IngestionRun, TariffMeasu
 from app.infrastructure.database.session import AsyncSessionMaker
 
 
-_CONSULT_URL = "https://ec.europa.eu/taxation_customs/dds2/taric/taric_consultation.jsp"
+_TARIC_URL = "https://ec.europa.eu/taxation_customs/dds2/taric/xml/taric_download.jsp"
+
+_MEASURE_TYPE_MAP: dict[str, str] = {
+    "103": "MFN",
+    "142": "PREFERENTIAL",
+    "551": "ANTI_DUMPING",
+    "552": "COUNTERVAILING",
+    "112": "SUSPENSION",
+    "115": "END_USE",
+}
 
 
-def _digits(hs_code: str) -> str:
-    return "".join(ch for ch in hs_code if ch.isdigit())
+def _local(tag: str) -> str:
+    if "}" in tag:
+        return tag.split("}", 1)[1]
+    return tag
 
 
-def _parse_pct_from_html(html: str) -> Decimal | None:
-    patterns = [
-        r"Third\s+country\s+duty[^%]{0,200}([\d.]+)\s*%",
-        r"Erga\s+omnes[^%]{0,200}([\d.]+)\s*%",
-        r"MFN[^%]{0,200}([\d.]+)\s*%",
-    ]
-    for pat in patterns:
-        m = re.search(pat, html, flags=re.IGNORECASE)
-        if m:
-            try:
-                return Decimal(m.group(1))
-            except Exception:
-                pass
-    m = re.search(r"([\d.]+)\s*%", html)
-    if not m:
+def _digits(value: str | None) -> str | None:
+    if not value:
+        return None
+    d = "".join(ch for ch in value if ch.isdigit())
+    return d or None
+
+
+def _parse_date(value: str | None) -> date | None:
+    if not value:
         return None
     try:
-        return Decimal(m.group(1))
+        return date.fromisoformat(value.strip())
     except Exception:
         return None
 
 
-def _parse_description_from_html(html: str, hs_code: str) -> str:
-    m = re.search(r"Description\s*</[^>]+>\s*<[^>]+>\s*([^<]{3,200})\s*<", html, flags=re.IGNORECASE)
-    if m:
-        desc = m.group(1).strip()
-        if desc:
-            return desc
-    m = re.search(rf"{re.escape(hs_code)}[^<]{{0,80}}</[^>]+>\s*<[^>]+>\s*([^<]{{3,200}})<", html, flags=re.IGNORECASE)
-    if m:
-        desc = m.group(1).strip()
-        if desc:
-            return desc
-    return f"HS {hs_code}"
+def _first_text(elem, names: tuple[str, ...]) -> str | None:
+    want = set(names)
+    for child in elem.iter():
+        if _local(child.tag) in want:
+            txt = (child.text or "").strip()
+            if txt:
+                return txt
+    return None
 
 
-async def _get_html_with_retries(client: httpx.AsyncClient, hs_code: str) -> tuple[str, str]:
+async def _download_taric_xml(*, params: dict[str, str]) -> str:
     backoff_s = 0.5
     last_exc: Exception | None = None
-    params = {"Lang": "en", "LangDescr": "EN", "Taric": hs_code}
     for _ in range(3):
         try:
-            resp = await client.get(_CONSULT_URL, params=params, headers={"Accept": "text/html"})
-            resp.raise_for_status()
-            return resp.text, str(resp.url)
+            async with httpx.AsyncClient(timeout=300) as client:
+                resp = await client.get(_TARIC_URL, params=params, headers={"Accept": "*/*"})
+                resp.raise_for_status()
+                content = resp.content
+            is_gzip = content[:2] == b"\x1f\x8b"
+            fd, path = tempfile.mkstemp(prefix="taric_", suffix=".xml")
+            os.close(fd)
+            if is_gzip:
+                xml_bytes = gzip.decompress(content)
+                with open(path, "wb") as f:
+                    f.write(xml_bytes)
+            else:
+                with open(path, "wb") as f:
+                    f.write(content)
+            return path
         except Exception as exc:
             last_exc = exc
             await asyncio.sleep(backoff_s)
             backoff_s *= 2
-    raise last_exc or RuntimeError("Request failed")
+    raise last_exc or RuntimeError("TARIC download failed")
 
 
-async def _upsert_hs_code(db: AsyncSession, *, hs_code: str, description: str) -> None:
-    stmt = (
-        insert(HSCode)
-        .values(
-            code=hs_code,
-            jurisdiction="EU",
-            description=description,
-            parent_code=None,
-            level=len(hs_code),
-            supplementary_unit=None,
-            valid_from=date.today(),
-            valid_to=None,
+async def _upsert_hs_codes(db: AsyncSession, rows: list[dict[str, Any]]) -> None:
+    for row in rows:
+        stmt = (
+            insert(HSCode)
+            .values(
+                code=row["code"],
+                jurisdiction="EU",
+                description=row["description"],
+                parent_code=None,
+                level=len(row["code"]),
+                supplementary_unit=None,
+                valid_from=row["valid_from"],
+                valid_to=None,
+            )
+            .on_conflict_do_update(
+                index_elements=[HSCode.code],
+                set_={
+                    "jurisdiction": "EU",
+                    "description": row["description"],
+                    "level": len(row["code"]),
+                    "valid_to": None,
+                },
+            )
         )
-        .on_conflict_do_update(
-            index_elements=[HSCode.code],
-            set_={
-                "jurisdiction": "EU",
-                "description": description,
-                "level": len(hs_code),
-                "valid_to": None,
-            },
-        )
-    )
-    await db.execute(stmt)
+        await db.execute(stmt)
 
 
-async def _upsert_mfn_measure(db: AsyncSession, *, hs_code: str, mfn_rate: Decimal | None, raw: dict[str, Any]) -> None:
+async def _upsert_measure(db: AsyncSession, *, row: dict[str, Any]) -> None:
     stmt = (
         insert(TariffMeasure)
         .values(
             id=uuid4(),
-            hs_code=hs_code,
+            hs_code=row["hs_code"],
             jurisdiction="EU",
-            measure_type="MFN",
-            country_of_origin=None,
+            measure_type=row["measure_type"],
+            country_of_origin=row["country_of_origin"],
             preferential_agreement=None,
-            rate_ad_valorem=mfn_rate,
-            rate_specific_amount=None,
-            rate_specific_unit=None,
+            rate_ad_valorem=row.get("rate_ad_valorem"),
+            rate_specific_amount=row.get("rate_specific_amount"),
+            rate_specific_unit=row.get("rate_specific_unit"),
             rate_minimum=None,
             rate_maximum=None,
             agricultural_component=None,
             quota_id=None,
-            suspension=False,
+            suspension=row.get("suspension", False),
             measure_condition=None,
-            raw_json=raw,
-            valid_from=date.today(),
-            valid_to=None,
+            raw_json=row.get("raw_json"),
+            valid_from=row["valid_from"],
+            valid_to=row.get("valid_to"),
             source_dataset="TARIC",
-            source_measure_id=f"EU_MFN:{hs_code}",
+            source_measure_id=row["source_measure_id"],
             ingested_at=datetime.utcnow(),
         )
         .on_conflict_do_update(
             index_elements=[TariffMeasure.source_dataset, TariffMeasure.source_measure_id],
             index_where=sa.text("source_measure_id IS NOT NULL"),
             set_={
-                "rate_ad_valorem": mfn_rate,
-                "raw_json": raw,
-                "valid_from": date.today(),
-                "valid_to": None,
+                "hs_code": row["hs_code"],
+                "jurisdiction": "EU",
+                "measure_type": row["measure_type"],
+                "country_of_origin": row["country_of_origin"],
+                "rate_ad_valorem": row.get("rate_ad_valorem"),
+                "rate_specific_amount": row.get("rate_specific_amount"),
+                "rate_specific_unit": row.get("rate_specific_unit"),
+                "suspension": row.get("suspension", False),
+                "raw_json": row.get("raw_json"),
+                "valid_from": row["valid_from"],
+                "valid_to": row.get("valid_to"),
                 "ingested_at": datetime.utcnow(),
             },
         )
@@ -143,10 +165,92 @@ async def _upsert_mfn_measure(db: AsyncSession, *, hs_code: str, mfn_rate: Decim
     await db.execute(stmt)
 
 
-async def ingest_delta() -> dict[str, Any]:
-    hs_codes_env = os.getenv("EU_TARIC_HS_CODES", "")
-    hs_codes = [_digits(c.strip()) for c in hs_codes_env.split(",") if _digits(c.strip())]
+def _parse_goods_nomenclature(xml_path: str) -> dict[str, str]:
+    leaf: dict[str, str] = {}
+    for event, elem in iterparse(xml_path, events=("end",)):
+        if _local(elem.tag) != "GOODS.NOMENCLATURE":
+            continue
+        hs = _digits(_first_text(elem, ("GOODS.NOMENCLATURE.ITEM.ID",)))
+        suffix = _first_text(elem, ("PRODUCTLINE.SUFFIX",))
+        if not hs or suffix != "80":
+            elem.clear()
+            continue
+        desc: str | None = None
+        for child in elem.iter():
+            if _local(child.tag) == "GOODS.NOMENCLATURE.DESCRIPTION.PERIOD":
+                lang = _first_text(child, ("LANGUAGE.ID",))
+                if lang == "EN":
+                    desc = _first_text(child, ("GOODS.NOMENCLATURE.DESCRIPTION",))
+                    break
+        leaf[hs] = (desc or f"HS {hs}").strip()
+        elem.clear()
+    return leaf
 
+
+def _extract_amount_fields(elem) -> tuple[Decimal | None, Decimal | None, str | None]:
+    amount_str = _first_text(elem, ("MEASURE.CONDITION.DUTY.AMOUNT", "DUTY.AMOUNT", "MEASURE.COMPONENT.DUTY.AMOUNT"))
+    expr_id = _first_text(elem, ("DUTY.EXPRESSION.ID", "MEASURE.CONDITION.DUTY.EXPRESSION.ID"))
+    unit = _first_text(elem, ("MONETARY.UNIT.CODE", "MEASUREMENT.UNIT.CODE", "MEASURE.CONDITION.MONETARY.UNIT.CODE"))
+    if not amount_str:
+        return None, None, None
+    try:
+        amount = Decimal(amount_str)
+    except Exception:
+        return None, None, None
+    if expr_id == "01" or unit is None:
+        return amount, None, None
+    return None, amount, unit
+
+
+def _parse_measures(xml_path: str, leaf_codes: set[str]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for event, elem in iterparse(xml_path, events=("end",)):
+        if _local(elem.tag) != "MEASURE":
+            continue
+        hs = _digits(_first_text(elem, ("GOODS.NOMENCLATURE.ITEM.ID",)))
+        if not hs or hs not in leaf_codes:
+            elem.clear()
+            continue
+        sid = _first_text(elem, ("MEASURE.SID",)) or f"TARIC:{hs}:{uuid4()}"
+        mt_id = _first_text(elem, ("MEASURE.TYPE.ID",))
+        if not mt_id or mt_id not in _MEASURE_TYPE_MAP:
+            elem.clear()
+            continue
+        geo = _first_text(elem, ("GEOGRAPHICAL.AREA.ID",))
+        origin = None
+        if geo and geo != "1011":
+            origin = geo
+        valid_from = _parse_date(_first_text(elem, ("VALIDITY.START.DATE",))) or date.today()
+        valid_to = _parse_date(_first_text(elem, ("VALIDITY.END.DATE",)))
+
+        rate_ad, rate_specific, unit = _extract_amount_fields(elem)
+        measure_type = _MEASURE_TYPE_MAP[mt_id]
+        suspension = measure_type in {"SUSPENSION", "END_USE"}
+        rows.append(
+            {
+                "hs_code": hs,
+                "measure_type": measure_type,
+                "country_of_origin": origin,
+                "rate_ad_valorem": rate_ad,
+                "rate_specific_amount": rate_specific,
+                "rate_specific_unit": unit,
+                "suspension": suspension,
+                "valid_from": valid_from,
+                "valid_to": valid_to,
+                "source_measure_id": str(sid),
+                "raw_json": {
+                    "measure_sid": str(sid),
+                    "measure_type_id": mt_id,
+                    "geographical_area_id": geo,
+                    "duty_expression_id": _first_text(elem, ("DUTY.EXPRESSION.ID", "MEASURE.CONDITION.DUTY.EXPRESSION.ID")),
+                },
+            }
+        )
+        elem.clear()
+    return rows
+
+
+async def _run_taric_ingest(*, mode: str, delta_date: date | None) -> dict[str, Any]:
     started = datetime.utcnow()
     async with AsyncSessionMaker() as db:
         run = IngestionRun(source="TARIC", status="running", started_at=started)
@@ -154,24 +258,39 @@ async def ingest_delta() -> dict[str, Any]:
         await db.commit()
         await db.refresh(run)
 
-        processed = 0
+        xml_path: str | None = None
         try:
-            async with httpx.AsyncClient(timeout=25) as client:
-                for hs in hs_codes:
-                    html, url = await _get_html_with_retries(client, hs)
-                    desc = _parse_description_from_html(html, hs)
-                    mfn = _parse_pct_from_html(html)
-                    await _upsert_hs_code(db, hs_code=hs, description=desc)
-                    await _upsert_mfn_measure(db, hs_code=hs, mfn_rate=mfn, raw={"url": url, "mfn": str(mfn) if mfn is not None else None})
-                    processed += 1
-                    await db.commit()
-                    await asyncio.sleep(0.2)
+            if mode == "full":
+                params = {"Expand": "true", "Lang": "EN"}
+            else:
+                d = delta_date or date.today()
+                params = {
+                    "Expand": "true",
+                    "Lang": "EN",
+                    "Year": str(d.year),
+                    "Month": f"{d.month:02d}",
+                    "Day": f"{d.day:02d}",
+                }
+            xml_path = await _download_taric_xml(params=params)
+            leaf_map = _parse_goods_nomenclature(xml_path)
+            leaf_codes = set(leaf_map.keys())
+
+            hs_rows = [{"code": code, "description": desc, "valid_from": date.today()} for code, desc in leaf_map.items()]
+            for i in range(0, len(hs_rows), 500):
+                await _upsert_hs_codes(db, hs_rows[i:i + 500])
+                await db.commit()
+
+            measures = _parse_measures(xml_path, leaf_codes)
+            for i in range(0, len(measures), 500):
+                for row in measures[i:i + 500]:
+                    await _upsert_measure(db, row=row)
+                await db.commit()
 
             run.status = "success"
-            run.records_processed = processed
+            run.records_processed = len(measures)
             run.completed_at = datetime.utcnow()
             await db.commit()
-            return {"source": "TARIC", "status": run.status, "hs_codes_processed": processed}
+            return {"source": "TARIC", "status": run.status, "records_processed": len(measures), "hs_codes": len(leaf_codes)}
         except Exception as exc:
             await db.rollback()
             run.status = "failed"
@@ -179,10 +298,22 @@ async def ingest_delta() -> dict[str, Any]:
             run.completed_at = datetime.utcnow()
             await db.commit()
             return {"source": "TARIC", "status": run.status, "error": str(exc)}
+        finally:
+            if xml_path:
+                try:
+                    os.remove(xml_path)
+                except Exception:
+                    pass
+
+
+async def ingest_delta() -> dict[str, Any]:
+    delta_date_env = os.getenv("TARIC_DELTA_DATE", "").strip()
+    d = _parse_date(delta_date_env) if delta_date_env else None
+    return await _run_taric_ingest(mode="delta", delta_date=d)
 
 
 async def ingest_full() -> dict[str, Any]:
-    return await ingest_delta()
+    return await _run_taric_ingest(mode="full", delta_date=None)
 
 
 def ingest_delta_sync() -> dict[str, Any]:
