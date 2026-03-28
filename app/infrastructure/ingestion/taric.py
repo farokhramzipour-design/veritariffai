@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 import gzip
 import os
+import re
 import tempfile
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
+from urllib.parse import urljoin
 from uuid import uuid4
 from xml.etree.ElementTree import iterparse
 
@@ -63,6 +65,21 @@ def _first_text(elem, names: tuple[str, ...]) -> str | None:
     return None
 
 
+def _extract_download_url(html: str, base_url: str) -> str | None:
+    hrefs = re.findall(r'href\s*=\s*["\']([^"\']+)["\']', html, flags=re.IGNORECASE)
+    candidates: list[str] = []
+    for href in hrefs:
+        if not href or href.startswith("#"):
+            continue
+        full = urljoin(base_url, href)
+        lower = full.lower()
+        if any(ext in lower for ext in (".xml", ".gz", ".zip")):
+            candidates.append(full)
+        elif "taric" in lower and "download" in lower:
+            candidates.append(full)
+    return candidates[0] if candidates else None
+
+
 async def _download_taric_xml(*, params: dict[str, str]) -> str:
     backoff_s = 0.75
     last_exc: Exception | None = None
@@ -77,15 +94,34 @@ async def _download_taric_xml(*, params: dict[str, str]) -> str:
                         "User-Agent": "veritariffai/1.0",
                     },
                 )
-                try:
-                    resp.raise_for_status()
-                except httpx.HTTPStatusError as exc:
-                    snippet = (exc.response.text or "")[:800]
-                    ct = exc.response.headers.get("content-type")
-                    raise ValueError(
-                        f"TARIC download failed: HTTP {exc.response.status_code} content-type={ct} url={exc.request.url} body={snippet}"
-                    ) from None
-                content = resp.content
+                ct = (resp.headers.get("content-type") or "").lower()
+                base = str(resp.url)
+
+                content: bytes
+                if resp.status_code == 200 and ("xml" in ct or "octet-stream" in ct or "gzip" in ct):
+                    content = resp.content
+                else:
+                    html = resp.text or ""
+                    dl = _extract_download_url(html, base)
+                    if not dl:
+                        snippet = html[:800]
+                        raise ValueError(
+                            f"TARIC download failed: HTTP {resp.status_code} content-type={ct} url={base} body={snippet}"
+                        )
+                    dl_resp = await client.get(
+                        dl,
+                        headers={
+                            "Accept": "application/xml,text/xml,*/*",
+                            "User-Agent": "veritariffai/1.0",
+                        },
+                    )
+                    dl_ct = (dl_resp.headers.get("content-type") or "").lower()
+                    if dl_resp.status_code != 200:
+                        snippet = (dl_resp.text or "")[:800]
+                        raise ValueError(
+                            f"TARIC download link failed: HTTP {dl_resp.status_code} content-type={dl_ct} url={dl_resp.url} body={snippet}"
+                        )
+                    content = dl_resp.content
             is_gzip = content[:2] == b"\x1f\x8b"
             fd, path = tempfile.mkstemp(prefix="taric_", suffix=".xml")
             os.close(fd)
