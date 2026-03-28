@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import io
 import json
+import re
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
@@ -87,6 +88,35 @@ def _digits(v: str | None) -> str | None:
         return None
     d = "".join(ch for ch in v if ch.isdigit())
     return d or None
+
+
+def _parse_duty_cell(duty_val: Any) -> tuple[Decimal | None, Decimal | None, str | None]:
+    if duty_val is None:
+        return None, None, None
+    if isinstance(duty_val, str):
+        s = duty_val.strip()
+        if not s:
+            return None, None, None
+        if "%" in s:
+            return _to_decimal(s), None, None
+
+        m = re.search(r"([0-9]+(?:[.,][0-9]+)?)\s*([A-Z]{3})\s*/\s*([A-Z0-9]{1,10})", s)
+        if m:
+            amount = _to_decimal(m.group(1))
+            unit = f"{m.group(2)}/{m.group(3)}"
+            return None, amount, unit if len(unit) <= 50 else None
+
+        m = re.search(r"([0-9]+(?:[.,][0-9]+)?)\s*([A-Z]{3})\s*([A-Z0-9]{1,10})", s)
+        if m:
+            amount = _to_decimal(m.group(1))
+            unit = f"{m.group(2)}/{m.group(3)}"
+            return None, amount, unit if len(unit) <= 50 else None
+
+        return _to_decimal(s), None, None
+
+    if isinstance(duty_val, (int, float, Decimal)):
+        return Decimal(str(duty_val)), None, None
+    return None, None, None
 
 
 def inspect_xlsx_bytes(data: bytes, *, max_rows: int = 5) -> dict[str, Any]:
@@ -285,17 +315,14 @@ async def ingest_duties_import_xlsx(db: AsyncSession, data: bytes) -> dict[str, 
         raw_digest = hashlib.sha256(json.dumps(raw_row, sort_keys=True).encode("utf-8")).hexdigest()
         source_measure_id = f"TARIC_XLSX:{raw_digest}"
 
-        rate_ad_valorem: Decimal | None = None
-        rate_specific_amount: Decimal | None = None
-        rate_specific_unit: str | None = None
-        currency = None
-        if isinstance(duty_val, str) and "%" in duty_val:
+        rate_ad_valorem: Decimal | None
+        rate_specific_amount: Decimal | None
+        rate_specific_unit: str | None
+        rate_ad_valorem, rate_specific_amount, rate_specific_unit = _parse_duty_cell(duty_val)
+        if rate_ad_valorem is None and rate_specific_amount is None:
             rate_ad_valorem = rate
-        elif isinstance(duty_val, str) and "/" in duty_val:
-            rate_specific_amount = rate
-            rate_specific_unit = duty_val.strip()
-        else:
-            rate_ad_valorem = rate
+        if rate_specific_unit and len(rate_specific_unit) > 50:
+            rate_specific_unit = None
 
         stmt = (
             insert(TariffMeasure)
