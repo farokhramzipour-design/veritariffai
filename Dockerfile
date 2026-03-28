@@ -31,4 +31,4 @@ COPY . .
 EXPOSE 8000
 
 # Run the application
-CMD ["gunicorn", "app.main:app", "--workers", "4", "--worker-class", "uvicorn.workers.UvicornWorker", "--bind", "0.0.0.0:8000"]
+CMD ["sh", "-c", "set -e; CELERY_PID=''; BEAT_PID=''; if [ \"${RUN_CELERY:-}\" = \"1\" ] || [ \"${RUN_CELERY:-}\" = \"true\" ]; then celery -A app.infrastructure.workers.celery_app.celery_app worker -l ${CELERY_LOG_LEVEL:-info} -Q ${CELERY_QUEUES:-data_ingestion} --concurrency=${CELERY_CONCURRENCY:-2} & CELERY_PID=$!; fi; if [ \"${RUN_CELERY_BEAT:-}\" = \"1\" ] || [ \"${RUN_CELERY_BEAT:-}\" = \"true\" ]; then celery -A app.infrastructure.workers.celery_app.celery_app beat -l ${CELERY_LOG_LEVEL:-info} & BEAT_PID=$!; fi; gunicorn app.main:app --workers ${WEB_WORKERS:-4} --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000 & WEB_PID=$!; trap 'kill -TERM $WEB_PID 2>/dev/null || true; if [ -n \"$CELERY_PID\" ]; then kill -TERM $CELERY_PID 2>/dev/null || true; fi; if [ -n \"$BEAT_PID\" ]; then kill -TERM $BEAT_PID 2>/dev/null || true; fi; wait' INT TERM; wait $WEB_PID"]

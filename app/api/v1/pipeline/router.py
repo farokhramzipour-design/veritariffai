@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+import os
+from contextlib import contextmanager
 from fastapi import APIRouter, Depends, Path, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -10,6 +13,21 @@ from app.infrastructure.database.session import get_session
 
 
 router = APIRouter()
+
+@contextmanager
+def _temp_env(key: str, value: str | None):
+    old = os.environ.get(key)
+    if value is None:
+        os.environ.pop(key, None)
+    else:
+        os.environ[key] = value
+    try:
+        yield
+    finally:
+        if old is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = old
 
 
 @router.get("/status")
@@ -37,10 +55,28 @@ async def pipeline_status(db: AsyncSession = Depends(get_session)):
 @router.post("/trigger/{source}")
 async def trigger_pipeline(
     source: str = Path(..., description="uk_tariff | eu_taric | eu_vat"),
+    mode: str = Query("async", description="async | sync"),
+    hs_codes: str | None = Query(None, description="Comma-separated HS codes for sync TARIC/UK runs"),
 ):
-    from app.infrastructure.workers.celery_app import celery_app
-
     source = source.strip().lower()
+    mode = mode.strip().lower()
+
+    if mode == "sync":
+        hs_codes_val = hs_codes.strip() if isinstance(hs_codes, str) else ""
+        if source == "eu_vat":
+            from app.infrastructure.ingestion.eu_vat import ingest as ingest_eu_vat
+            return ok({"accepted": True, "mode": "sync", "source": source, "result": await asyncio.wait_for(ingest_eu_vat(), timeout=120)})
+        if source == "eu_taric":
+            from app.infrastructure.ingestion.taric import ingest_delta as ingest_taric
+            with _temp_env("EU_TARIC_HS_CODES", hs_codes_val or None):
+                return ok({"accepted": True, "mode": "sync", "source": source, "result": await asyncio.wait_for(ingest_taric(), timeout=180)})
+        if source == "uk_tariff":
+            from app.infrastructure.ingestion.ukgt import ingest_delta as ingest_ukgt
+            with _temp_env("UK_TARIFF_HS_CODES", hs_codes_val or None):
+                return ok({"accepted": True, "mode": "sync", "source": source, "result": await asyncio.wait_for(ingest_ukgt(), timeout=240)})
+        return ok({"accepted": False, "error": "Unknown source"})
+
+    from app.infrastructure.workers.celery_app import celery_app
     if source == "uk_tariff":
         task = "app.infrastructure.workers.tasks.ingest_ukgt_delta"
     elif source == "eu_taric":
