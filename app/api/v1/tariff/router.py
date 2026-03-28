@@ -186,6 +186,13 @@ def _destination_market(dest: str) -> str | None:
     return None
 
 
+def _normalize_origin_iso2(code: str) -> str:
+    c = (code or "").strip().upper()
+    if c == "UK":
+        return "GB"
+    return c
+
+
 def _origin_groups(origin: str) -> set[str]:
     iso2 = origin.upper().strip()
     groups = {iso2}
@@ -543,13 +550,15 @@ async def tariff_lookup(
     origin: str = Query(...),
     destination: str = Query(...),
     cif_price_eur_per_dtn: float | None = Query(None),
+    full_report: bool = Query(False, description="Include full measure record list for this HS code"),
     db: AsyncSession = Depends(get_session),
 ):
     hs = _digits(hs_code)
     if len(hs) < 6:
         raise HTTPException(status_code=422, detail="hs_code must be at least 6 digits")
 
-    origin_cc = origin.upper()
+    origin_input = origin.upper().strip()
+    origin_cc = _normalize_origin_iso2(origin_input)
     if not (len(origin_cc) == 2 and origin_cc.isalpha()):
         raise HTTPException(status_code=422, detail="origin must be a 2-letter ISO country code")
     dest_cc = destination.upper()
@@ -557,7 +566,7 @@ async def tariff_lookup(
     if not market:
         raise HTTPException(status_code=422, detail="destination must be an EU country or GB/UK")
 
-    await ensure_origin(db, origin_code=origin_cc, origin_name=None)
+    await ensure_origin(db, origin_code=origin_cc, origin_name=origin_cc)
     await ensure_origin(db, origin_code="1011", origin_name="ERGA OMNES")
     await db.commit()
 
@@ -702,7 +711,10 @@ async def tariff_lookup(
 
     warnings: list[str] = []
     if duty is None:
-        warnings.append("No duty record found for this HS code in the tariff_measures dataset. Duties ingestion may not have run successfully yet.")
+        if not all_measures:
+            warnings.append("No tariff measures found for this HS code in the database for this market. Run EU TARIC ingestion (or duties_import XLSX) to populate tariff_measures.")
+        else:
+            warnings.append("No duty record matched the resolved origin codes. Try another origin or review full_report records.")
     if siv_bands:
         warnings.append("Rate is determined by SIV price bands. Provide your declared CIF price for an indicative rate.")
     if has_entry_price:
@@ -845,10 +857,60 @@ async def tariff_lookup(
                 "saving_pct": saving_pct,
             }
 
+    records: list[dict] = []
+    if full_report:
+        def _record_for_measure(m: TariffMeasure) -> dict:
+            origin_code_val = _measure_origin_code(m)
+            origin_row_val = origin_map.get(origin_code_val)
+            origin_name_val = origin_row_val.origin_name if origin_row_val else ("ERGA OMNES" if origin_code_val == "1011" else origin_code_val)
+            raw = m.raw_json if isinstance(m.raw_json, dict) else {}
+            duty_meta_entry = _measure_duty_meta(m)
+            duty_expr = duty_meta_entry.get("raw_expression") if duty_meta_entry and isinstance(duty_meta_entry.get("raw_expression"), str) else None
+            return {
+                "hs_code": m.hs_code,
+                "market": market,
+                "origin_code": origin_code_val,
+                "origin_name": origin_name_val,
+                "origin_code_type": origin_row_val.origin_code_type if origin_row_val else None,
+                "measure_type": m.measure_type,
+                "rate_basis": _rate_basis_for_measure(measure_type=m.measure_type, origin_code=origin_code_val),
+                "duty_rate": _measure_duty_rate_pct(m),
+                "duty_amount": float(m.rate_specific_amount) if m.rate_specific_amount is not None else None,
+                "rate_specific_unit": m.rate_specific_unit,
+                "valid_from": m.valid_from.isoformat() if m.valid_from else None,
+                "valid_to": m.valid_to.isoformat() if m.valid_to else None,
+                "source": m.source_dataset,
+                "ingested_at": m.ingested_at.isoformat() if m.ingested_at else None,
+                "details": {
+                    "measure_type_text": raw.get("Measure type") or raw.get("measure_type_text"),
+                    "measure_type_code": raw.get("Meas. type code") or raw.get("Meas type code") or raw.get("measure_type_id"),
+                    "origin_text": raw.get("Origin") or raw.get("origin"),
+                    "origin_code_raw": raw.get("Origin code") or raw.get("geographical_area_id"),
+                    "legal_base": raw.get("Legal base") or raw.get("Legal basis") or raw.get("legal_base"),
+                    "regulation": raw.get("Regulation") or raw.get("regulation"),
+                    "additional_code": raw.get("Add code") or raw.get("Add code.") or raw.get("add_code"),
+                    "order_no": raw.get("Order No.") or raw.get("Order No") or raw.get("Order number"),
+                    "duty_text": raw.get("Duty") or duty_expr,
+                },
+            }
+
+        records = [_record_for_measure(m) for m in all_measures]
+        records = sorted(
+            records,
+            key=lambda r: (
+                len(str(r.get("hs_code") or "")),
+                _origin_specificity(str(r.get("origin_code") or "")),
+                str(r.get("measure_type") or ""),
+                r.get("ingested_at") or "",
+            ),
+            reverse=True,
+        )[:300]
+
     payload = {
         "hs_code": hs,
         "description": description,
         "origin_country": origin_cc,
+        "origin_input": origin_input,
         "destination_country": dest_cc,
         "destination_market": market,
         "origin": {
@@ -865,6 +927,7 @@ async def tariff_lookup(
         "origin_resolution": origin_resolution,
         "rates_by_origin": rates_by_origin,
         "best_rate": best_rate,
+        "records": records,
         "duty": {
             "rate_type": duty.measure_type if duty else None,
             "duty_rate": (

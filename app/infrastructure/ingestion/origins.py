@@ -87,3 +87,10 @@ async def ensure_origin(
             .where(Origin.origin_code == code, Origin.member_iso2_codes.is_(None))
             .values(member_iso2_codes=member_iso2_codes, group_category=group_category, is_group=True)
         )
+
+    if origin_name and origin_name.strip():
+        await db.execute(
+            sa.update(Origin)
+            .where(Origin.origin_code == code, Origin.origin_name == Origin.origin_code)
+            .values(origin_name=origin_name.strip(), last_updated=datetime.utcnow())
+        )
