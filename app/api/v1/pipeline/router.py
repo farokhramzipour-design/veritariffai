@@ -36,7 +36,7 @@ def _temp_env(key: str, value: str | None):
 
 @router.get("/status")
 async def pipeline_status(db: AsyncSession = Depends(get_session)):
-    sources = ["TARIC", "UK_TARIFF", "EU_VAT"]
+    sources = ["TARIC", "UK_TARIFF", "UK_TARIFF_FULL", "EU_VAT"]
     out: dict[str, dict] = {}
     for source in sources:
         res = await db.execute(
@@ -56,11 +56,60 @@ async def pipeline_status(db: AsyncSession = Depends(get_session)):
     return ok(out)
 
 
+@router.get("/runs")
+async def pipeline_runs(
+    source: str | None = Query(None),
+    limit: int = Query(20, ge=1, le=200),
+    db: AsyncSession = Depends(get_session),
+):
+    q = select(IngestionRun).order_by(IngestionRun.started_at.desc()).limit(limit)
+    if isinstance(source, str) and source.strip():
+        q = q.where(IngestionRun.source == source.strip())
+    res = await db.execute(q)
+    runs = res.scalars().all()
+    return ok(
+        {
+            "count": len(runs),
+            "items": [
+                {
+                    "id": str(r.id),
+                    "source": r.source,
+                    "status": r.status,
+                    "records_processed": r.records_processed,
+                    "started_at": r.started_at.isoformat() if r.started_at else None,
+                    "completed_at": r.completed_at.isoformat() if r.completed_at else None,
+                    "error_details": r.error_details,
+                }
+                for r in runs
+            ],
+        }
+    )
+
+
+@router.get("/celery/inspect")
+async def celery_inspect(timeout_s: float = Query(2.0)):
+    from app.infrastructure.workers.celery_app import celery_app
+
+    try:
+        insp = celery_app.control.inspect(timeout=timeout_s)
+        return ok(
+            {
+                "active": insp.active() or {},
+                "reserved": insp.reserved() or {},
+                "scheduled": insp.scheduled() or {},
+                "stats": insp.stats() or {},
+            }
+        )
+    except Exception as exc:
+        return ok({"active": {}, "reserved": {}, "scheduled": {}, "stats": {}, "error": str(exc)})
+
+
 @router.post("/trigger/{source}")
 async def trigger_pipeline(
     source: str = Path(..., description="uk_tariff | uk_tariff_full | eu_taric | eu_taric_full | eu_vat"),
     mode: str = Query("async", description="async | sync"),
     hs_codes: str | None = Query(None, description="Comma-separated HS codes for sync TARIC/UK runs"),
+    resume: bool = Query(False, description="Resume full UK tariff ingestion from last checkpoint"),
 ):
     source = source.strip().lower()
     mode = mode.strip().lower()
@@ -79,8 +128,11 @@ async def trigger_pipeline(
         if source in {"uk_tariff", "uk_tariff_full"}:
             from app.infrastructure.ingestion.ukgt import ingest_delta as ingest_ukgt
             if source == "uk_tariff_full":
+                if resume:
+                    from app.infrastructure.ingestion.ukgt import ingest_full_resume as ingest_ukgt_full_resume
+                    return ok({"accepted": True, "mode": "sync", "source": source, "resume": True, "result": await asyncio.wait_for(ingest_ukgt_full_resume(), timeout=3600)})
                 from app.infrastructure.ingestion.ukgt import ingest_full as ingest_ukgt_full
-                return ok({"accepted": True, "mode": "sync", "source": source, "result": await asyncio.wait_for(ingest_ukgt_full(), timeout=3600)})
+                return ok({"accepted": True, "mode": "sync", "source": source, "resume": False, "result": await asyncio.wait_for(ingest_ukgt_full(), timeout=3600)})
             with _temp_env("UK_TARIFF_HS_CODES", hs_codes_val or None):
                 return ok({"accepted": True, "mode": "sync", "source": source, "result": await asyncio.wait_for(ingest_ukgt(), timeout=240)})
         return ok({"accepted": False, "error": "Unknown source"})
@@ -99,7 +151,8 @@ async def trigger_pipeline(
     else:
         return ok({"accepted": False, "error": "Unknown source"})
 
-    r = celery_app.send_task(task, kwargs={}, queue="data_ingestion")
+    kwargs = {"resume": bool(resume)} if source == "uk_tariff_full" else {}
+    r = celery_app.send_task(task, kwargs=kwargs, queue="data_ingestion")
     return ok({"accepted": True, "source": source, "task_id": str(r.id)})
 
 
@@ -353,6 +406,23 @@ async def sample_complete_lookups(
         duty = await _pick_best_duty(db, hs_code=hs, market=market, origin=origin)
         if not duty:
             continue
+        if vat is None and market == "EU":
+            from app.adapters.vat_adapter import get_vat_data
+
+            vat_data = await get_vat_data(destination=dest, hs_code=hs)
+            vat_payload = {
+                "country_code": dest,
+                "rate_type": (vat_data.vat_category or "UNKNOWN").lower(),
+                "vat_rate": float(vat_data.vat_rate) if vat_data.vat_rate is not None else None,
+                "source": "fallback_static",
+            }
+        else:
+            vat_payload = {
+                "country_code": vat.country_code if vat else dest,
+                "rate_type": vat.rate_type if vat else None,
+                "vat_rate": float(vat.vat_rate) if vat else None,
+                "source": vat.source if vat else None,
+            }
         out.append(
             {
                 "hs_code": hs,
@@ -366,12 +436,7 @@ async def sample_complete_lookups(
                     "rate_specific_unit": duty.rate_specific_unit,
                     "source": duty.source_dataset,
                 },
-                "vat": {
-                    "country_code": vat.country_code if vat else dest,
-                    "rate_type": vat.rate_type if vat else None,
-                    "vat_rate": float(vat.vat_rate) if vat else None,
-                    "source": vat.source if vat else None,
-                },
+                "vat": vat_payload,
             }
         )
         if len(out) >= limit:

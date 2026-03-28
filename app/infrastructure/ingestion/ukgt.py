@@ -10,10 +10,11 @@ from typing import Any
 
 import httpx
 import sqlalchemy as sa
+from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.infrastructure.database.models import HSCode, IngestionRun, TariffMeasure, VATRate
+from app.infrastructure.database.models import HSCode, IngestionRun, PipelineConfig, TariffMeasure, VATRate
 from app.infrastructure.database.session import AsyncSessionMaker
 from app.infrastructure.ingestion.duty_parser import parse_duty_expression, duty_to_human_readable
 
@@ -263,6 +264,20 @@ async def _upsert_gb_vat(db: AsyncSession, vat_rate: Decimal | None, raw_json: d
     await db.execute(stmt)
 
 
+async def _get_pipeline_config(db: AsyncSession, key: str) -> str | None:
+    res = await db.execute(select(PipelineConfig.value).where(PipelineConfig.key == key).limit(1))
+    return res.scalar_one_or_none()
+
+
+async def _set_pipeline_config(db: AsyncSession, key: str, value: str | None) -> None:
+    stmt = (
+        insert(PipelineConfig)
+        .values(key=key, value=value)
+        .on_conflict_do_update(index_elements=[PipelineConfig.key], set_={"value": value, "updated_at": sa.text("now()")})
+    )
+    await db.execute(stmt)
+
+
 async def _ingest_commodity(db: AsyncSession, client: httpx.AsyncClient, hs_code: str) -> dict[str, int]:
     hs = _digits(hs_code)
     payload = await _get_json_with_retries(
@@ -451,7 +466,7 @@ async def _ingest_targeted(hs_codes: list[str]) -> dict[str, Any]:
             return {"source": "UK_TARIFF", "status": run.status, "error": str(exc)}
 
 
-async def _ingest_full(max_commodities: int | None) -> dict[str, Any]:
+async def _ingest_full(max_commodities: int | None, *, resume: bool) -> dict[str, Any]:
     started = datetime.utcnow()
     async with AsyncSessionMaker() as db:
         run = IngestionRun(source="UK_TARIFF_FULL", status="running", started_at=started)
@@ -459,8 +474,23 @@ async def _ingest_full(max_commodities: int | None) -> dict[str, Any]:
         await db.commit()
         await db.refresh(run)
 
+        resume_section_id = await _get_pipeline_config(db, "ukgt_full_last_section_id") if resume else None
+        resume_chapter_code = await _get_pipeline_config(db, "ukgt_full_last_chapter_code") if resume else None
+        resume_heading_code = await _get_pipeline_config(db, "ukgt_full_last_heading_code") if resume else None
+        resume_hs = await _get_pipeline_config(db, "ukgt_full_last_hs") if resume else None
+
+        skipping = bool(resume and (resume_section_id or resume_chapter_code or resume_heading_code or resume_hs))
+        matched_section = False if skipping else True
+        matched_chapter = False if skipping else True
+        matched_heading = False if skipping else True
+        matched_hs = False if skipping else True
+
         commodities_ingested = 0
         measures_upserted = 0
+        last_section_id = None
+        last_chapter_code = None
+        last_heading_code = None
+        last_hs = None
         try:
             async with httpx.AsyncClient(timeout=25) as client:
                 sections = await _fetch_all_pages(client, f"{_API_V2}/sections")
@@ -468,6 +498,11 @@ async def _ingest_full(max_commodities: int | None) -> dict[str, Any]:
                     section_id = section.get("id")
                     if not isinstance(section_id, str) or not section_id:
                         continue
+                    last_section_id = section_id
+                    if skipping and not matched_section:
+                        if resume_section_id and section_id != resume_section_id:
+                            continue
+                        matched_section = True
 
                     section_detail = await _get_json_with_retries(
                         client,
@@ -488,6 +523,11 @@ async def _ingest_full(max_commodities: int | None) -> dict[str, Any]:
                             chapters.append(chapter_code)
 
                     for chapter_code in sorted(set(chapters)):
+                        last_chapter_code = chapter_code
+                        if skipping and matched_section and not matched_chapter:
+                            if resume_chapter_code and chapter_code != resume_chapter_code:
+                                continue
+                            matched_chapter = True
                         chapter_detail = await _get_json_with_retries(
                             client,
                             f"{_API_V2}/chapters/{chapter_code}",
@@ -507,6 +547,11 @@ async def _ingest_full(max_commodities: int | None) -> dict[str, Any]:
                                 headings.append(heading_code)
 
                         for heading_code in sorted(set(headings)):
+                            last_heading_code = heading_code
+                            if skipping and matched_section and matched_chapter and not matched_heading:
+                                if resume_heading_code and heading_code != resume_heading_code:
+                                    continue
+                                matched_heading = True
                             heading_detail = await _get_json_with_retries(
                                 client,
                                 f"{_API_V2}/headings/{heading_code}",
@@ -532,15 +577,32 @@ async def _ingest_full(max_commodities: int | None) -> dict[str, Any]:
                                 hs = _digits(code)
                                 if len(hs) < 6:
                                     continue
+                                if skipping and matched_section and matched_chapter and matched_heading and not matched_hs:
+                                    if resume_hs and hs != resume_hs:
+                                        continue
+                                    matched_hs = True
+                                    continue
 
                                 counts = await _ingest_commodity(db, client, hs)
                                 commodities_ingested += counts["commodities"]
                                 measures_upserted += counts["measures"]
+                                last_hs = hs
+                                if commodities_ingested % 50 == 0:
+                                    await _set_pipeline_config(db, "ukgt_full_last_section_id", last_section_id)
+                                    await _set_pipeline_config(db, "ukgt_full_last_chapter_code", last_chapter_code)
+                                    await _set_pipeline_config(db, "ukgt_full_last_heading_code", last_heading_code)
+                                    await _set_pipeline_config(db, "ukgt_full_last_hs", last_hs)
+                                    run.records_processed = commodities_ingested
                                 await db.commit()
                                 await asyncio.sleep(0.2)
                                 if max_commodities is not None and commodities_ingested >= max_commodities:
                                     raise StopAsyncIteration()
         except StopAsyncIteration:
+            if last_hs:
+                await _set_pipeline_config(db, "ukgt_full_last_section_id", last_section_id)
+                await _set_pipeline_config(db, "ukgt_full_last_chapter_code", last_chapter_code)
+                await _set_pipeline_config(db, "ukgt_full_last_heading_code", last_heading_code)
+                await _set_pipeline_config(db, "ukgt_full_last_hs", last_hs)
             run.status = "partial"
             run.records_processed = commodities_ingested
             run.completed_at = datetime.utcnow()
@@ -553,12 +615,22 @@ async def _ingest_full(max_commodities: int | None) -> dict[str, Any]:
             }
         except Exception as exc:
             await db.rollback()
+            if last_hs:
+                await _set_pipeline_config(db, "ukgt_full_last_section_id", last_section_id)
+                await _set_pipeline_config(db, "ukgt_full_last_chapter_code", last_chapter_code)
+                await _set_pipeline_config(db, "ukgt_full_last_heading_code", last_heading_code)
+                await _set_pipeline_config(db, "ukgt_full_last_hs", last_hs)
             run.status = "failed"
-            run.error_details = str(exc)
+            run.error_details = f"{exc} (last_section={last_section_id} last_chapter={last_chapter_code} last_heading={last_heading_code} last_hs={last_hs})"
             run.completed_at = datetime.utcnow()
             await db.commit()
             return {"source": "UK_TARIFF_FULL", "status": run.status, "error": str(exc)}
 
+        if last_hs:
+            await _set_pipeline_config(db, "ukgt_full_last_section_id", last_section_id)
+            await _set_pipeline_config(db, "ukgt_full_last_chapter_code", last_chapter_code)
+            await _set_pipeline_config(db, "ukgt_full_last_heading_code", last_heading_code)
+            await _set_pipeline_config(db, "ukgt_full_last_hs", last_hs)
         run.status = "success"
         run.records_processed = commodities_ingested
         run.completed_at = datetime.utcnow()
@@ -582,7 +654,14 @@ async def ingest_delta() -> dict[str, Any]:
 async def ingest_full() -> dict[str, Any]:
     max_commodities_env = os.getenv("UK_TARIFF_MAX_COMMODITIES", "").strip()
     max_commodities = int(max_commodities_env) if max_commodities_env.isdigit() else None
-    return await _ingest_full(max_commodities)
+    resume = (os.getenv("UK_TARIFF_RESUME", "").strip().lower() in {"1", "true", "yes"})
+    return await _ingest_full(max_commodities, resume=resume)
+
+
+async def ingest_full_resume() -> dict[str, Any]:
+    max_commodities_env = os.getenv("UK_TARIFF_MAX_COMMODITIES", "").strip()
+    max_commodities = int(max_commodities_env) if max_commodities_env.isdigit() else None
+    return await _ingest_full(max_commodities, resume=True)
 
 
 def ingest_delta_sync() -> dict[str, Any]:
@@ -591,3 +670,7 @@ def ingest_delta_sync() -> dict[str, Any]:
 
 def ingest_full_sync() -> dict[str, Any]:
     return asyncio.run(ingest_full())
+
+
+def ingest_full_resume_sync() -> dict[str, Any]:
+    return asyncio.run(ingest_full_resume())

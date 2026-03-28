@@ -29,11 +29,13 @@ def ingest_ukgt_delta():
 
 
 @shared_task(name="app.infrastructure.workers.tasks.ingest_ukgt_full", queue="data_ingestion")
-def ingest_ukgt_full():
+def ingest_ukgt_full(resume: bool = False):
     from app.infrastructure.database.session import run_migrations_sync
-    from app.infrastructure.ingestion.ukgt import ingest_full_sync
+    from app.infrastructure.ingestion.ukgt import ingest_full_resume_sync, ingest_full_sync
 
     run_migrations_sync(raise_on_error=True)
+    if resume:
+        return ingest_full_resume_sync()
     return ingest_full_sync()
 
 
