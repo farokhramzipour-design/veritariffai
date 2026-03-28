@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Security
 
 from app.core.deps import get_current_user
 
@@ -32,7 +32,7 @@ _public.include_router(health_router, prefix="/health", tags=["health"])
 _public.include_router(auth_router, prefix="/auth", tags=["auth"])
 
 # ── Protected routes (valid Bearer JWT required on every request) ─────────────
-_protected = APIRouter(dependencies=[Depends(get_current_user)])
+_protected = APIRouter(dependencies=[Security(get_current_user)])
 _protected.include_router(calculations_router, prefix="/calculations", tags=["calculations"])
 _protected.include_router(users_router, prefix="/users", tags=["users"])
 _protected.include_router(subs_router, prefix="/subscriptions", tags=["subscriptions"])

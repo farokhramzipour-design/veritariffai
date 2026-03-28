@@ -5,7 +5,8 @@ import hmac
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import Depends, Header
+from fastapi import Depends, Header, Security
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,6 +23,7 @@ except Exception:
     redis = None
 
 logger = logging.getLogger(__name__)
+_bearer = HTTPBearer(auto_error=False)
 
 
 class CurrentUser(BaseModel):
@@ -40,13 +42,20 @@ def _is_uuid(value: str) -> bool:
 
 
 async def get_current_user(
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Security(_bearer)] = None,
     authorization: Annotated[str | None, Header(alias="Authorization")] = None,
     db: AsyncSession = Depends(get_session),
 ) -> CurrentUser:
-    if not authorization or not authorization.lower().startswith("bearer "):
+    token: str | None = None
+    if credentials and credentials.scheme and credentials.credentials:
+        if credentials.scheme.lower() == "bearer":
+            token = credentials.credentials
+    if token is None and authorization and authorization.lower().startswith("bearer "):
+        token = authorization.split(" ", 1)[1]
+
+    if not token:
         raise APIError(401, "UNAUTHENTICATED", "Missing or invalid JWT")
 
-    token = authorization.split(" ", 1)[1]
     try:
         claims = verify_jwt(token)
     except Exception:
