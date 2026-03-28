@@ -257,16 +257,30 @@ async def _download_bytes(url: str, *, max_bytes: int) -> bytes:
 async def taric_xlsx_import_from_url(
     kind: str = Query(..., description="duties_import | nomenclature_en"),
     url: str = Query(...),
+    mode: str = Query("async", description="async | sync"),
     db: AsyncSession = Depends(get_session),
 ):
     if not (url.startswith("https://") or url.startswith("http://")):
         return ok({"accepted": False, "error": "url must start with http(s)://"})
 
     kind = kind.strip().lower()
+    mode = mode.strip().lower()
+
+    if mode == "async":
+        from app.infrastructure.workers.celery_app import celery_app
+
+        r = celery_app.send_task(
+            "app.infrastructure.workers.tasks.ingest_taric_xlsx_from_url",
+            args=[kind, url],
+            kwargs={},
+            queue="data_ingestion",
+        )
+        return ok({"accepted": True, "mode": "async", "kind": kind, "url": url, "task_id": str(r.id)})
     run = IngestionRun(source="TARIC", status="running", started_at=datetime.utcnow())
     db.add(run)
     await db.commit()
     await db.refresh(run)
+
 
     try:
         data = await _download_bytes(url, max_bytes=80 * 1024 * 1024)
