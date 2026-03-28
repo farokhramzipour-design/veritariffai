@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import hmac
 from typing import Annotated
 from uuid import UUID
 
@@ -127,3 +128,13 @@ def require_plan(required: PlanTier):
         requires_plan(user.plan, required, None)
         return user
     return checker
+
+
+async def require_admin_key(
+    x_admin_key: Annotated[str | None, Header(alias="X-Admin-Key")] = None,
+) -> None:
+    expected = settings.admin_api_key
+    if not expected:
+        raise APIError(503, "ADMIN_NOT_CONFIGURED", "Admin API key is not configured")
+    if not x_admin_key or not hmac.compare_digest(x_admin_key, expected):
+        raise APIError(403, "FORBIDDEN", "Invalid admin key")

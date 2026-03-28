@@ -49,6 +49,7 @@ class Settings(BaseSettings):
     vies_wsdl_url: Optional[str] = None
     azure_ad_client_id: Optional[str] = None
     academic_mock_enabled: bool = True
+    admin_api_key: Optional[str] = None
 
     class Config:
         env_file = ".env"

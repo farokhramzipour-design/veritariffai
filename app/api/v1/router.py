@@ -9,6 +9,7 @@ from app.api.v1.calculations.router import router as calculations_router
 from app.api.v1.users.router import router as users_router
 from app.api.v1.subscriptions.router import router as subs_router
 from app.api.v1.tariff.router import router as tariff_router
+from app.api.v1.pipeline.router import router as pipeline_router
 from app.api.v1.internal.router import router as internal_router
 from app.api.v1.webhooks.router import router as webhooks_router
 from app.api.v1.duty_rate.router import router as duty_rate_router
@@ -23,7 +24,6 @@ from app.api.v1.workflow.router import router as workflow_router
 from app.api.v1.shipments.router import router as shipments_router
 from app.api.v1.workspace.router import router as workspace_router
 from app.api.v1.import_analysis.router import router as import_analysis_router
-from app.api.v1.analytics.router import router as analytics_router
 
 
 # ── Public routes (no token required) ────────────────────────────────────────
@@ -37,6 +37,7 @@ _protected.include_router(calculations_router, prefix="/calculations", tags=["ca
 _protected.include_router(users_router, prefix="/users", tags=["users"])
 _protected.include_router(subs_router, prefix="/subscriptions", tags=["subscriptions"])
 _protected.include_router(tariff_router, prefix="/tariff", tags=["tariff"])
+_protected.include_router(pipeline_router, prefix="/pipeline", tags=["pipeline"])
 _protected.include_router(internal_router, prefix="/internal", tags=["internal"])
 _protected.include_router(webhooks_router, prefix="/webhooks", tags=["webhooks"])
 _protected.include_router(duty_rate_router, tags=["duty-rate"])
@@ -51,7 +52,6 @@ _protected.include_router(workflow_router, prefix="/workflow", tags=["workflow"]
 _protected.include_router(shipments_router, prefix="/shipments", tags=["shipments"])
 _protected.include_router(workspace_router, prefix="/workspace", tags=["workspace"])
 _protected.include_router(import_analysis_router, prefix="/import-analysis", tags=["import-analysis"])
-_protected.include_router(analytics_router, prefix="/analytics", tags=["analytics"])
 
 # ── Master router ─────────────────────────────────────────────────────────────
 api_router = APIRouter()

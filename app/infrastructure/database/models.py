@@ -211,6 +211,7 @@ class TariffMeasure(Base):
     quota_id: Mapped[Optional[str]] = mapped_column(UUID(as_uuid=True), ForeignKey("tariff.tariff_quotas.id"))
     suspension: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     measure_condition: Mapped[Optional[dict]] = mapped_column(JSONB)
+    raw_json: Mapped[Optional[dict]] = mapped_column(JSONB)
     valid_from: Mapped[date] = mapped_column(Date, nullable=False)
     valid_to: Mapped[Optional[date]] = mapped_column(Date)
     source_dataset: Mapped[str] = mapped_column(String(20), nullable=False)
@@ -227,6 +228,29 @@ Index(
     TariffMeasure.valid_to,
 )
 Index("idx_tariff_measures_valid", TariffMeasure.valid_to)
+
+# ---------- tariff.vat_rates ----------
+
+
+class VATRate(Base):
+    __tablename__ = "vat_rates"
+    __table_args__ = {"schema": "tariff"}
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid4)
+    country_code: Mapped[str] = mapped_column(String(2), nullable=False)
+    jurisdiction: Mapped[str] = mapped_column(String(5), nullable=False)
+    rate_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    vat_rate: Mapped[Decimal] = mapped_column(NUMERIC(6, 3), nullable=False)
+    hs_code_prefix: Mapped[Optional[str]] = mapped_column(String(6))
+    valid_from: Mapped[Optional[date]] = mapped_column(Date)
+    valid_to: Mapped[Optional[date]] = mapped_column(Date)
+    source: Mapped[Optional[str]] = mapped_column(String(30))
+    raw_json: Mapped[Optional[dict]] = mapped_column(JSONB)
+    ingested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
+
+
+Index("idx_vat_rates_country", VATRate.country_code)
+Index("idx_vat_rates_lookup", VATRate.country_code, VATRate.jurisdiction, VATRate.hs_code_prefix)
 
 # ---------- tariff.tariff_quotas ----------
 

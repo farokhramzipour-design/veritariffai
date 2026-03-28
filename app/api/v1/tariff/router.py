@@ -1,5 +1,6 @@
 from __future__ import annotations
-from fastapi import APIRouter, Query, HTTPException
+from datetime import date
+from fastapi import APIRouter, Depends, Query, HTTPException
 from app.core.responses import ok
 from pydantic import BaseModel, Field
 from typing import List, Optional
@@ -7,6 +8,13 @@ from app.config import settings
 import hashlib
 import json
 import re
+import sqlalchemy as sa
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.infrastructure.database.models import TariffMeasure, VATRate
+from app.infrastructure.database.session import get_session
+from app.utils.country import is_eu
 
 try:
     import redis
@@ -162,3 +170,178 @@ async def hs_search(q: str = Query(""), jurisdiction: str = Query("UK"), limit: 
 @router.get("/hs-codes/{code}")
 async def hs_detail(code: str, jurisdiction: str = Query("UK")):
     return ok({"code": code, "description": "...", "measures": [{"measure_type": "AD_VALOREM", "rate_ad_valorem": 0.0, "country_of_origin": None, "valid_from": "2024-01-01", "valid_to": None}], "supplementary_unit": "p/st"})
+
+
+def _digits(hs_code: str) -> str:
+    return "".join(ch for ch in hs_code if ch.isdigit())
+
+
+def _destination_market(dest: str) -> str | None:
+    d = dest.upper()
+    if d in ("GB", "UK"):
+        return "GB"
+    if is_eu(d):
+        return "EU"
+    return None
+
+
+def _origin_groups(origin: str) -> set[str]:
+    iso2 = origin.upper().strip()
+    groups = {iso2}
+    if is_eu(iso2):
+        groups.add("EU")
+        groups.add("1011")
+    return groups
+
+
+async def _pick_best_duty(
+    db: AsyncSession,
+    *,
+    hs_code: str,
+    market: str,
+    origin: str,
+) -> TariffMeasure | None:
+    today = date.today()
+    groups = _origin_groups(origin)
+    res = await db.execute(
+        select(TariffMeasure)
+        .where(
+            TariffMeasure.hs_code == hs_code,
+            TariffMeasure.jurisdiction == market,
+            TariffMeasure.valid_from <= today,
+            sa.or_(TariffMeasure.valid_to.is_(None), TariffMeasure.valid_to >= today),
+        )
+        .order_by(TariffMeasure.ingested_at.desc())
+    )
+    measures = res.scalars().all()
+    if not measures:
+        return None
+
+    def matches_origin(m: TariffMeasure) -> bool:
+        if m.country_of_origin is None:
+            return True
+        return str(m.country_of_origin).upper() in groups
+
+    preferential = [
+        m for m in measures
+        if m.measure_type == "PREFERENTIAL" and matches_origin(m) and m.rate_ad_valorem is not None
+    ]
+    if preferential:
+        return sorted(preferential, key=lambda m: (m.rate_ad_valorem, m.ingested_at), reverse=False)[0]
+
+    additional = [
+        m for m in measures
+        if m.measure_type in ("ANTI_DUMPING", "COUNTERVAILING", "ADDITIONAL") and matches_origin(m)
+        and m.rate_ad_valorem is not None
+    ]
+    if additional:
+        return sorted(additional, key=lambda m: (m.rate_ad_valorem, m.ingested_at), reverse=True)[0]
+
+    mfn = [
+        m for m in measures
+        if m.measure_type == "MFN" and (m.country_of_origin is None) and m.rate_ad_valorem is not None
+    ]
+    if mfn:
+        return sorted(mfn, key=lambda m: m.ingested_at, reverse=True)[0]
+    return None
+
+
+async def _pick_vat(
+    db: AsyncSession,
+    *,
+    hs_code: str,
+    market: str,
+    country_code: str,
+) -> VATRate | None:
+    today = date.today()
+    cc = country_code.upper()
+
+    prefix_stmt = (
+        select(VATRate)
+        .where(
+            VATRate.country_code == cc,
+            VATRate.jurisdiction == market,
+            VATRate.hs_code_prefix.is_not(None),
+            sa.literal(hs_code).like(sa.func.concat(VATRate.hs_code_prefix, "%")),
+            sa.or_(VATRate.valid_from.is_(None), VATRate.valid_from <= today),
+            sa.or_(VATRate.valid_to.is_(None), VATRate.valid_to >= today),
+        )
+        .order_by(sa.func.length(VATRate.hs_code_prefix).desc(), VATRate.ingested_at.desc())
+        .limit(1)
+    )
+    res = await db.execute(prefix_stmt)
+    vat = res.scalar_one_or_none()
+    if vat:
+        return vat
+
+    fallback_stmt = (
+        select(VATRate)
+        .where(
+            VATRate.country_code == cc,
+            VATRate.jurisdiction == market,
+            VATRate.hs_code_prefix.is_(None),
+            sa.or_(VATRate.valid_from.is_(None), VATRate.valid_from <= today),
+            sa.or_(VATRate.valid_to.is_(None), VATRate.valid_to >= today),
+        )
+        .order_by(sa.case((VATRate.rate_type == "standard", 0), else_=1), VATRate.ingested_at.desc())
+        .limit(1)
+    )
+    res = await db.execute(fallback_stmt)
+    return res.scalar_one_or_none()
+
+
+@router.get("/lookup")
+async def tariff_lookup(
+    hs_code: str = Query(...),
+    origin: str = Query(...),
+    destination: str = Query(...),
+    db: AsyncSession = Depends(get_session),
+):
+    hs = _digits(hs_code)
+    if len(hs) < 6:
+        raise HTTPException(status_code=422, detail="hs_code must be at least 6 digits")
+
+    origin_cc = origin.upper()
+    dest_cc = destination.upper()
+    market = _destination_market(dest_cc)
+    if not market:
+        raise HTTPException(status_code=422, detail="destination must be an EU country or GB/UK")
+
+    duty = await _pick_best_duty(db, hs_code=hs, market=market, origin=origin_cc)
+    vat = await _pick_vat(db, hs_code=hs, market=market, country_code=dest_cc)
+
+    payload = {
+        "hs_code": hs,
+        "origin_country": origin_cc,
+        "destination_country": dest_cc,
+        "destination_market": market,
+        "duty": None,
+        "vat": None,
+        "calculated": {
+            "duty_on_goods_value_pct": float(duty.rate_ad_valorem) if duty and duty.rate_ad_valorem is not None else None,
+            "vat_applies_to": "goods_value + duty",
+            "note": "VAT is assessed on CIF value + customs duty",
+        },
+        "data_freshness": {
+            "duty_last_updated": duty.ingested_at.date().isoformat() if duty else None,
+            "vat_last_updated": vat.ingested_at.date().isoformat() if vat else None,
+        },
+    }
+
+    if duty:
+        payload["duty"] = {
+            "rate_type": duty.measure_type,
+            "duty_rate": float(duty.rate_ad_valorem) if duty.rate_ad_valorem is not None else None,
+            "trade_agreement": duty.preferential_agreement,
+            "source": duty.source_dataset,
+        }
+
+    if vat:
+        payload["vat"] = {
+            "country_code": vat.country_code,
+            "rate_type": vat.rate_type,
+            "vat_rate": float(vat.vat_rate),
+            "source": vat.source,
+        }
+
+    return ok(payload)

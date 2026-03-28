@@ -81,16 +81,12 @@ Rules:
 - incoterms: standard 3-letter code (EXW, FOB, CIF, DAP, DDP, …) or null.
 - hs_code in line items: best 6–10 digit code you can identify; null if absent.
 - weight_kg: convert to kg if another unit is stated; null if unknown.
-- Treat "Exporter", "Seller", "Supplier", "Shipper" as the seller.
-- Treat "Importer", "Buyer", "Consignee" as the buyer.
 
 Response format (JSON only):
 {
   "invoice_number": "string or null",
   "invoice_date": "YYYY-MM-DD or null",
   "po_number": "string or null",
-  "exporter_seller_name": "string or null",
-  "importer_buyer_name": "string or null",
 
   "seller": {
     "name": "string or null",
@@ -243,35 +239,5 @@ def extract_invoice_fields(pdf_bytes: bytes, filename: str = "invoice.pdf") -> d
     extracted["warnings"] = warnings + ai_warnings
     extracted["source_filename"] = filename
     extracted["raw_text_chars"] = len(raw_text)
-
-    def _clean(v: object) -> str | None:
-        if not isinstance(v, str):
-            return None
-        s = v.strip()
-        return s or None
-
-    seller = extracted.get("seller")
-    if not isinstance(seller, dict):
-        seller = {}
-        extracted["seller"] = seller
-
-    buyer = extracted.get("buyer")
-    if not isinstance(buyer, dict):
-        buyer = {}
-        extracted["buyer"] = buyer
-
-    seller_name = _clean(seller.get("name"))
-    buyer_name = _clean(buyer.get("name"))
-
-    exporter_name = _clean(extracted.get("exporter_seller_name")) or seller_name
-    importer_name = _clean(extracted.get("importer_buyer_name")) or buyer_name
-
-    extracted["exporter_seller_name"] = exporter_name
-    extracted["importer_buyer_name"] = importer_name
-
-    if not seller_name and exporter_name:
-        seller["name"] = exporter_name
-    if not buyer_name and importer_name:
-        buyer["name"] = importer_name
 
     return extracted
