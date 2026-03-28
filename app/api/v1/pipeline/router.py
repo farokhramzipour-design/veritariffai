@@ -50,7 +50,7 @@ async def trigger_pipeline(
     else:
         return ok({"accepted": False, "error": "Unknown source"})
 
-    r = celery_app.send_task(task, kwargs={})
+    r = celery_app.send_task(task, kwargs={}, queue="data_ingestion")
     return ok({"accepted": True, "source": source, "task_id": str(r.id)})
 
 
@@ -58,7 +58,7 @@ async def trigger_pipeline(
 async def trigger_eu_vat():
     from app.infrastructure.workers.celery_app import celery_app
 
-    r = celery_app.send_task("app.infrastructure.workers.tasks.ingest_eu_vat", kwargs={})
+    r = celery_app.send_task("app.infrastructure.workers.tasks.ingest_eu_vat", kwargs={}, queue="data_ingestion")
     return ok({"accepted": True, "source": "eu_vat", "task_id": str(r.id)})
 
 
@@ -66,7 +66,7 @@ async def trigger_eu_vat():
 async def trigger_uk_tariff():
     from app.infrastructure.workers.celery_app import celery_app
 
-    r = celery_app.send_task("app.infrastructure.workers.tasks.ingest_ukgt_delta", kwargs={})
+    r = celery_app.send_task("app.infrastructure.workers.tasks.ingest_ukgt_delta", kwargs={}, queue="data_ingestion")
     return ok({"accepted": True, "source": "uk_tariff", "task_id": str(r.id)})
 
 
@@ -74,7 +74,7 @@ async def trigger_uk_tariff():
 async def trigger_eu_taric():
     from app.infrastructure.workers.celery_app import celery_app
 
-    r = celery_app.send_task("app.infrastructure.workers.tasks.ingest_taric_delta", kwargs={})
+    r = celery_app.send_task("app.infrastructure.workers.tasks.ingest_taric_delta", kwargs={}, queue="data_ingestion")
     return ok({"accepted": True, "source": "eu_taric", "task_id": str(r.id)})
 
 
