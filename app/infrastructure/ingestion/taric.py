@@ -172,6 +172,12 @@ async def _upsert_hs_codes(db: AsyncSession, rows: list[dict[str, Any]]) -> None
 
 
 async def _upsert_measure(db: AsyncSession, *, row: dict[str, Any]) -> None:
+    from app.infrastructure.ingestion.origins import ensure_origin
+
+    origin_code = row.get("country_of_origin")
+    if origin_code:
+        await ensure_origin(db, origin_code=str(origin_code), origin_name=None)
+
     stmt = (
         insert(TariffMeasure)
         .values(
@@ -271,9 +277,7 @@ def _parse_measures(xml_path: str, leaf_codes: set[str]) -> list[dict[str, Any]]
             elem.clear()
             continue
         geo = _first_text(elem, ("GEOGRAPHICAL.AREA.ID",))
-        origin = None
-        if geo and geo != "1011":
-            origin = geo
+        origin = geo or "1011"
         valid_from = _parse_date(_first_text(elem, ("VALIDITY.START.DATE",))) or date.today()
         valid_to = _parse_date(_first_text(elem, ("VALIDITY.END.DATE",)))
 

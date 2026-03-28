@@ -200,7 +200,7 @@ class TariffMeasure(Base):
     hs_code: Mapped[str] = mapped_column(String(12), ForeignKey("tariff.hs_codes.code"), nullable=False)
     jurisdiction: Mapped[str] = mapped_column(String(5), nullable=False)
     measure_type: Mapped[str] = mapped_column(String(50), nullable=False)
-    country_of_origin: Mapped[Optional[str]] = mapped_column(String(5))
+    country_of_origin: Mapped[Optional[str]] = mapped_column(String(10))
     preferential_agreement: Mapped[Optional[str]] = mapped_column(String(100))
     rate_ad_valorem: Mapped[Optional[Decimal]] = mapped_column(NUMERIC(8, 4))
     rate_specific_amount: Mapped[Optional[Decimal]] = mapped_column(NUMERIC(14, 4))
@@ -228,6 +228,31 @@ Index(
     TariffMeasure.valid_to,
 )
 Index("idx_tariff_measures_valid", TariffMeasure.valid_to)
+
+# ---------- tariff.origins ----------
+
+
+class Origin(Base):
+    __tablename__ = "origins"
+    __table_args__ = {"schema": "tariff"}
+
+    origin_code: Mapped[str] = mapped_column(String(10), primary_key=True)
+    origin_name: Mapped[str] = mapped_column(Text, nullable=False)
+    origin_code_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    iso2: Mapped[Optional[str]] = mapped_column(String(2))
+    iso3: Mapped[Optional[str]] = mapped_column(String(3))
+    is_eu_member: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    is_erga_omnes: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    is_group: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    member_iso2_codes: Mapped[Optional[list[str]]] = mapped_column(ARRAY(String(2)))
+    group_category: Mapped[Optional[str]] = mapped_column(String(30))
+    notes: Mapped[Optional[str]] = mapped_column(Text)
+    last_updated: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
+
+
+Index("idx_origins_iso2", Origin.iso2)
+Index("idx_origins_code_type", Origin.origin_code_type)
+Index("idx_origins_group_cat", Origin.group_category)
 
 # ---------- tariff.vat_rates ----------
 

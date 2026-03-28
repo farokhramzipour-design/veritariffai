@@ -12,8 +12,9 @@ import sqlalchemy as sa
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.infrastructure.database.models import CertificateCode, DutyUnit, HSCode, TariffMeasure, VATRate
+from app.infrastructure.database.models import CertificateCode, DutyUnit, HSCode, Origin, TariffMeasure, VATRate
 from app.infrastructure.database.session import get_session
+from app.infrastructure.ingestion.origins import ensure_origin
 from app.utils.country import is_eu
 
 try:
@@ -194,6 +195,51 @@ def _origin_groups(origin: str) -> set[str]:
     return groups
 
 
+async def _resolve_origin_codes_for_country(db: AsyncSession, iso2: str) -> list[str]:
+    cc = iso2.upper().strip()
+    codes: list[str] = []
+    if cc:
+        codes.append(cc)
+        if is_eu(cc):
+            codes.append("EU")
+
+    res = await db.execute(
+        select(Origin.origin_code)
+        .where(
+            Origin.is_group.is_(True),
+            Origin.member_iso2_codes.is_not(None),
+            Origin.member_iso2_codes.contains([cc]),
+        )
+    )
+    codes.extend([c for c in res.scalars().all() if isinstance(c, str)])
+
+    codes.append("1011")
+    seen: set[str] = set()
+    out: list[str] = []
+    for c in codes:
+        c = (c or "").strip().upper()
+        if not c or c in seen:
+            continue
+        seen.add(c)
+        out.append(c)
+    return out
+
+
+def _origin_specificity(origin_code: str | None) -> int:
+    code = (origin_code or "").strip().upper()
+    if not code or code == "1011":
+        return 5
+    if len(code) == 2 and code.isalpha():
+        return 1
+    if len(code) == 4 and code.isdigit():
+        if code.startswith("4"):
+            return 3
+        if code.startswith("5"):
+            return 4
+        return 2
+    return 6
+
+
 def _hs_candidates(hs_code: str) -> list[str]:
     hs = _digits(hs_code)
     candidates: list[str] = []
@@ -205,6 +251,69 @@ def _hs_candidates(hs_code: str) -> list[str]:
     return candidates
 
 
+def _measure_has_any_duty(m: TariffMeasure) -> bool:
+    if m.rate_ad_valorem is not None or m.rate_specific_amount is not None:
+        return True
+    if isinstance(m.measure_condition, dict):
+        duty_meta = m.measure_condition.get("duty")
+        if isinstance(duty_meta, dict):
+            if duty_meta.get("is_nihil"):
+                return True
+            if duty_meta.get("siv_bands") or duty_meta.get("has_entry_price"):
+                return True
+            if duty_meta.get("duty_unit") or duty_meta.get("duty_expression_code"):
+                return True
+            raw_expression = duty_meta.get("raw_expression")
+            if isinstance(raw_expression, str) and raw_expression.strip():
+                return True
+    return False
+
+
+def _measure_origin_code(m: TariffMeasure) -> str:
+    code = (m.country_of_origin or "1011").strip().upper()
+    return code or "1011"
+
+
+def _measure_duty_meta(m: TariffMeasure) -> dict | None:
+    if not isinstance(m.measure_condition, dict):
+        return None
+    duty_meta = m.measure_condition.get("duty")
+    if not isinstance(duty_meta, dict):
+        return None
+    return duty_meta
+
+
+def _measure_is_nihil(m: TariffMeasure) -> bool:
+    duty_meta = _measure_duty_meta(m)
+    return bool(duty_meta.get("is_nihil")) if duty_meta else False
+
+
+def _measure_duty_rate_pct(m: TariffMeasure) -> float | None:
+    if m.rate_ad_valorem is not None:
+        return float(m.rate_ad_valorem)
+    if _measure_is_nihil(m):
+        return 0.0
+    return None
+
+
+def _rate_basis_for_measure(*, measure_type: str | None, origin_code: str | None) -> str | None:
+    oc = (origin_code or "").strip().upper()
+    mt = (measure_type or "").strip().upper()
+    if not oc or not mt:
+        return None
+    if oc == "1011":
+        return "MFN"
+    if mt == "PREFERENTIAL":
+        return "bilateral_preference" if (len(oc) == 2 and oc.isalpha()) else "group_preference"
+    if mt in ("ANTI_DUMPING", "COUNTERVAILING"):
+        return "anti_dumping"
+    if mt == "ADDITIONAL":
+        return "additional"
+    if mt == "SAFEGUARD":
+        return "safeguard"
+    return mt.lower()
+
+
 async def _pick_best_duty(
     db: AsyncSession,
     *,
@@ -213,7 +322,7 @@ async def _pick_best_duty(
     origin: str,
 ) -> TariffMeasure | None:
     today = date.today()
-    groups = _origin_groups(origin)
+    resolved_codes = await _resolve_origin_codes_for_country(db, origin)
     candidates = _hs_candidates(hs_code)
     res = await db.execute(
         select(TariffMeasure)
@@ -230,36 +339,27 @@ async def _pick_best_duty(
         return None
 
     def matches_origin(m: TariffMeasure) -> bool:
-        if m.country_of_origin is None:
-            return True
-        return str(m.country_of_origin).upper() in groups
-
-    def has_any_duty(m: TariffMeasure) -> bool:
-        if m.rate_ad_valorem is not None or m.rate_specific_amount is not None:
-            return True
-        if isinstance(m.measure_condition, dict):
-            duty_meta = m.measure_condition.get("duty")
-            if isinstance(duty_meta, dict):
-                if duty_meta.get("siv_bands") or duty_meta.get("has_entry_price"):
-                    return True
-                if duty_meta.get("duty_unit") or duty_meta.get("duty_expression_code"):
-                    return True
-        return False
+        code = (m.country_of_origin or "1011").strip().upper()
+        return code in resolved_codes
 
     preferential = [
         m for m in measures
-        if m.measure_type == "PREFERENTIAL" and matches_origin(m) and has_any_duty(m)
+        if m.measure_type == "PREFERENTIAL" and matches_origin(m) and _measure_has_any_duty(m)
     ]
     if preferential:
         pref_av = [m for m in preferential if m.rate_ad_valorem is not None]
         if pref_av:
-            return sorted(pref_av, key=lambda m: (m.rate_ad_valorem, m.ingested_at), reverse=False)[0]
-        return sorted(preferential, key=lambda m: m.ingested_at, reverse=True)[0]
+            return sorted(
+                pref_av,
+                key=lambda m: (_origin_specificity(m.country_of_origin), m.rate_ad_valorem, m.ingested_at),
+                reverse=False,
+            )[0]
+        return sorted(preferential, key=lambda m: (_origin_specificity(m.country_of_origin), m.ingested_at), reverse=False)[0]
 
     additional = [
         m for m in measures
         if m.measure_type in ("ANTI_DUMPING", "COUNTERVAILING", "ADDITIONAL") and matches_origin(m)
-        and has_any_duty(m)
+        and _measure_has_any_duty(m)
     ]
     if additional:
         add_av = [m for m in additional if m.rate_ad_valorem is not None]
@@ -269,7 +369,9 @@ async def _pick_best_duty(
 
     mfn = [
         m for m in measures
-        if m.measure_type == "MFN" and (m.country_of_origin is None) and has_any_duty(m)
+        if m.measure_type == "MFN"
+        and ((m.country_of_origin or "1011").strip().upper() == "1011")
+        and _measure_has_any_duty(m)
     ]
     if mfn:
         return sorted(mfn, key=lambda m: m.ingested_at, reverse=True)[0]
@@ -286,7 +388,7 @@ async def _other_measures(
     limit: int = 30,
 ) -> list[dict]:
     today = date.today()
-    groups = _origin_groups(origin)
+    resolved_codes = await _resolve_origin_codes_for_country(db, origin)
     candidates = _hs_candidates(hs_code)
     types = ("TARIFF_QUOTA", "SAFEGUARD", "IMPORT_CONTROL")
 
@@ -305,9 +407,8 @@ async def _other_measures(
     measures = res.scalars().all()
 
     def matches_origin(m: TariffMeasure) -> bool:
-        if m.country_of_origin is None:
-            return True
-        return str(m.country_of_origin).upper() in groups
+        code = (m.country_of_origin or "1011").strip().upper()
+        return code in resolved_codes
 
     out: list[dict] = []
     for m in measures:
@@ -449,10 +550,38 @@ async def tariff_lookup(
         raise HTTPException(status_code=422, detail="hs_code must be at least 6 digits")
 
     origin_cc = origin.upper()
+    if not (len(origin_cc) == 2 and origin_cc.isalpha()):
+        raise HTTPException(status_code=422, detail="origin must be a 2-letter ISO country code")
     dest_cc = destination.upper()
     market = _destination_market(dest_cc)
     if not market:
         raise HTTPException(status_code=422, detail="destination must be an EU country or GB/UK")
+
+    await ensure_origin(db, origin_code=origin_cc, origin_name=None)
+    await ensure_origin(db, origin_code="1011", origin_name="ERGA OMNES")
+    await db.commit()
+
+    res = await db.execute(select(Origin).where(Origin.origin_code == origin_cc).limit(1))
+    origin_row = res.scalar_one_or_none()
+
+    resolved_origin_codes = await _resolve_origin_codes_for_country(db, origin_cc)
+    res = await db.execute(select(Origin).where(Origin.origin_code.in_(resolved_origin_codes)))
+    origin_rows = res.scalars().all()
+    origin_map: dict[str, Origin] = {o.origin_code: o for o in origin_rows}
+    origin_resolution: list[dict] = []
+    for code in resolved_origin_codes:
+        row = origin_map.get(code)
+        origin_resolution.append(
+            {
+                "origin_code": code,
+                "exists": row is not None,
+                "origin_name": row.origin_name if row else f"Unknown — code {code}",
+                "origin_code_type": row.origin_code_type if row else None,
+                "is_group": bool(row.is_group) if row else None,
+                "is_erga_omnes": bool(row.is_erga_omnes) if row else (code == "1011"),
+                "group_category": row.group_category if row else None,
+            }
+        )
 
     duty = await _pick_best_duty(db, hs_code=hs, market=market, origin=origin_cc)
     vat = await _pick_vat(db, hs_code=hs, market=market, country_code=dest_cc)
@@ -572,6 +701,8 @@ async def tariff_lookup(
             variable_rate_evaluated = True
 
     warnings: list[str] = []
+    if duty is None:
+        warnings.append("No duty record found for this HS code in the tariff_measures dataset. Duties ingestion may not have run successfully yet.")
     if siv_bands:
         warnings.append("Rate is determined by SIV price bands. Provide your declared CIF price for an indicative rate.")
     if has_entry_price:
@@ -606,15 +737,141 @@ async def tariff_lookup(
             if any(isinstance(c, dict) and c.get("certificate_code") == "N-990" for c in conds):
                 warnings.append("This rate requires a valid Tariff Rate Quota licence (N-990). Check quota balance before shipping.")
 
+    duty_origin_code = (duty.country_of_origin or "1011").strip().upper() if duty else None
+    duty_origin_name = None
+    if duty_origin_code:
+        res = await db.execute(select(Origin.origin_name).where(Origin.origin_code == duty_origin_code).limit(1))
+        duty_origin_name = res.scalar_one_or_none()
+
+    rate_basis = _rate_basis_for_measure(measure_type=duty.measure_type if duty else None, origin_code=duty_origin_code)
+
+    today = date.today()
+    candidates = _hs_candidates(hs)
+    res = await db.execute(
+        select(TariffMeasure)
+        .where(
+            TariffMeasure.hs_code.in_(candidates),
+            TariffMeasure.jurisdiction == market,
+            TariffMeasure.valid_from <= today,
+            sa.or_(TariffMeasure.valid_to.is_(None), TariffMeasure.valid_to >= today),
+        )
+        .order_by(sa.func.length(TariffMeasure.hs_code).desc(), TariffMeasure.ingested_at.desc())
+    )
+    all_measures = res.scalars().all()
+    measures_for_origin = [
+        m
+        for m in all_measures
+        if _measure_origin_code(m) in resolved_origin_codes and _measure_has_any_duty(m)
+    ]
+
+    cert_codes_all: list[str] = []
+    for m in measures_for_origin:
+        if isinstance(m.measure_condition, dict):
+            conds = m.measure_condition.get("conditions")
+            if isinstance(conds, list):
+                for c in conds:
+                    if isinstance(c, dict):
+                        cc = c.get("certificate_code")
+                        if isinstance(cc, str) and cc:
+                            cert_codes_all.append(cc)
+    cert_map_all = await _certificate_descriptions(db, cert_codes_all)
+
+    def _best_for_origin(code: str) -> TariffMeasure | None:
+        pool = [m for m in measures_for_origin if _measure_origin_code(m) == code]
+        if not pool and code == "1011":
+            pool = [m for m in all_measures if (m.country_of_origin is None) and m.measure_type == "MFN" and _measure_has_any_duty(m)]
+        if not pool:
+            return None
+        pref = [m for m in pool if m.measure_type == "PREFERENTIAL"]
+        if pref:
+            pref_av = [m for m in pref if m.rate_ad_valorem is not None]
+            if pref_av:
+                return sorted(pref_av, key=lambda m: (float(m.rate_ad_valorem), m.ingested_at), reverse=False)[0]
+            return sorted(pref, key=lambda m: m.ingested_at, reverse=True)[0]
+        mfn_pool = [m for m in pool if m.measure_type == "MFN"]
+        if mfn_pool:
+            return sorted(mfn_pool, key=lambda m: m.ingested_at, reverse=True)[0]
+        return sorted(pool, key=lambda m: m.ingested_at, reverse=True)[0]
+
+    rates_by_origin: list[dict] = []
+    for code in resolved_origin_codes:
+        m = _best_for_origin(code)
+        row = origin_map.get(code)
+        origin_name_val = row.origin_name if row else ("ERGA OMNES" if code == "1011" else f"Unknown — code {code}")
+        origin_code_type_val = row.origin_code_type if row else None
+        duty_meta_entry = _measure_duty_meta(m) if m else None
+        human = duty_meta_entry.get("human_readable") if duty_meta_entry and isinstance(duty_meta_entry.get("human_readable"), str) else None
+        raw_expr = duty_meta_entry.get("raw_expression") if duty_meta_entry and isinstance(duty_meta_entry.get("raw_expression"), str) else None
+        conds_rendered: list[dict] = []
+        if m and isinstance(m.measure_condition, dict):
+            conds = m.measure_condition.get("conditions")
+            if isinstance(conds, list):
+                conds_rendered = _render_duty_conditions([c for c in conds if isinstance(c, dict)], cert_map_all)
+        rates_by_origin.append(
+            {
+                "origin_code": code,
+                "origin_name": origin_name_val,
+                "origin_code_type": origin_code_type_val,
+                "rate_basis": _rate_basis_for_measure(measure_type=m.measure_type if m else None, origin_code=code),
+                "rate_type": m.measure_type if m else None,
+                "duty_rate": _measure_duty_rate_pct(m) if m else None,
+                "duty_amount": float(m.rate_specific_amount) if m and m.rate_specific_amount is not None else None,
+                "duty_unit": m.rate_specific_unit if m else None,
+                "valid_from": m.valid_from.isoformat() if m else None,
+                "valid_to": m.valid_to.isoformat() if m and m.valid_to else None,
+                "source": m.source_dataset if m else None,
+                "duty_expression": raw_expr,
+                "human_readable": human,
+                "conditions": conds_rendered,
+            }
+        )
+
+    mfn_entry = next((r for r in rates_by_origin if r.get("origin_code") == "1011"), None)
+    best_rate = None
+    if duty and mfn_entry:
+        try:
+            best_val = float(duty.rate_ad_valorem) if duty.rate_ad_valorem is not None else (0.0 if is_nihil else None)
+        except Exception:
+            best_val = None
+        mfn_val = mfn_entry.get("duty_rate")
+        if isinstance(best_val, (int, float)) and isinstance(mfn_val, (int, float)):
+            saving_vs_mfn = float(mfn_val) - float(best_val)
+            saving_pct = (saving_vs_mfn / float(mfn_val) * 100.0) if float(mfn_val) > 0 else None
+            best_rate = {
+                "origin_code": duty_origin_code,
+                "rate_basis": rate_basis,
+                "duty_rate": best_val,
+                "saving_vs_mfn": saving_vs_mfn,
+                "saving_pct": saving_pct,
+            }
+
     payload = {
         "hs_code": hs,
         "description": description,
         "origin_country": origin_cc,
         "destination_country": dest_cc,
         "destination_market": market,
+        "origin": {
+            "origin_code": origin_cc,
+            "origin_name": origin_row.origin_name if origin_row else None,
+            "origin_code_type": origin_row.origin_code_type if origin_row else "country",
+            "iso2": origin_row.iso2 if origin_row else origin_cc,
+            "iso3": origin_row.iso3 if origin_row else None,
+            "is_erga_omnes": bool(origin_row.is_erga_omnes) if origin_row else False,
+            "is_group": bool(origin_row.is_group) if origin_row else False,
+            "group_category": origin_row.group_category if origin_row else None,
+            "exists": origin_row is not None,
+        },
+        "origin_resolution": origin_resolution,
+        "rates_by_origin": rates_by_origin,
+        "best_rate": best_rate,
         "duty": {
             "rate_type": duty.measure_type if duty else None,
-            "duty_rate": float(duty.rate_ad_valorem) if duty and duty.rate_ad_valorem is not None else None,
+            "duty_rate": (
+                float(duty.rate_ad_valorem)
+                if duty and duty.rate_ad_valorem is not None
+                else (0.0 if duty and is_nihil else None)
+            ),
             "duty_amount": duty_amount,
             "currency": duty_currency,
             "duty_unit": duty_unit,
@@ -635,6 +892,9 @@ async def tariff_lookup(
             "trade_agreement": duty.preferential_agreement if duty else None,
             "financial_charge": True if duty else None,
             "source": duty.source_dataset if duty else None,
+            "origin_code": duty_origin_code,
+            "origin_name": duty_origin_name,
+            "rate_basis": rate_basis,
             "conditions": duty_conditions,
             "human_readable": duty_human_readable,
         },
@@ -646,7 +906,11 @@ async def tariff_lookup(
             "source": vat.source if vat else None,
         },
         "calculated": {
-            "duty_on_goods_value_pct": float(duty.rate_ad_valorem) if duty and duty.rate_ad_valorem is not None else None,
+            "duty_on_goods_value_pct": (
+                float(duty.rate_ad_valorem)
+                if duty and duty.rate_ad_valorem is not None
+                else (0.0 if duty and is_nihil else None)
+            ),
             "effective_duty_rate": effective_duty_rate,
             "effective_duty_amount": effective_duty_amount,
             "effective_duty_unit": effective_duty_unit,

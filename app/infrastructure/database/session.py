@@ -47,6 +47,36 @@ def _ensure_alembic_version_capacity(conn) -> None:
         conn.commit()
 
 
+def reset_db_sync(*, include_public: bool = False) -> None:
+    sync_url = (
+        _build_db_url()
+        .replace("postgresql+asyncpg://", "postgresql+psycopg://")
+        .replace("postgres+asyncpg://", "postgresql+psycopg://")
+    )
+    engine_sync = sa.create_engine(sync_url, pool_pre_ping=True)
+    schemas = ["identity", "subscriptions", "calculations", "tariff", "fx", "compliance", "ingestion"]
+    with engine_sync.connect() as conn:
+        conn.execute(sa.text("DROP TABLE IF EXISTS public.alembic_version"))
+        for schema in schemas:
+            conn.execute(sa.text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+        if include_public:
+            conn.execute(
+                sa.text(
+                    """
+                    DO $$
+                    DECLARE r RECORD;
+                    BEGIN
+                      FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname = 'public')
+                      LOOP
+                        EXECUTE format('DROP TABLE IF EXISTS public.%I CASCADE', r.tablename);
+                      END LOOP;
+                    END $$;
+                    """
+                )
+            )
+        conn.commit()
+
+
 def run_migrations_sync(*, raise_on_error: bool = False) -> bool:
     try:
         from alembic import command

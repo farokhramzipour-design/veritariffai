@@ -16,6 +16,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.infrastructure.database.models import CertificateCode, DutyUnit, HSCode, TariffMeasure
+from app.infrastructure.ingestion.origins import ensure_origin
 from app.infrastructure.ingestion.duty_parser import (
     duty_to_human_readable,
     parse_duty_expression,
@@ -493,18 +494,20 @@ async def ingest_duties_import_xlsx(db: AsyncSession, data: bytes) -> dict[str, 
             hs_codes_upserted += 1
             seen_hs.add(hs)
 
-        origin = None
+        origin = "1011"
+        origin_name_value = None
         origin_code = _to_str(row[origin_code_col] if origin_code_col is not None and origin_code_col < len(row) else None)
         if origin_code:
             o = origin_code.strip().upper()
             if o not in {"1011", "ERGA OMNES", "ALL", "WORLD"}:
-                origin = o[:5]
+                origin = o[:10]
         else:
             origin_raw = _to_str(row[origin_name_col] if origin_name_col is not None and origin_name_col < len(row) else None)
+            origin_name_value = origin_raw
             if origin_raw:
                 o = origin_raw.strip().upper()
                 if o not in {"1011", "ERGA OMNES", "ALL", "WORLD"}:
-                    origin = o[:5]
+                    origin = o[:10]
 
         mt_id = _to_str(row[mt_code_col] if mt_code_col is not None and mt_code_col < len(row) else None)
         mt_name = _to_str(row[mt_name_col] if mt_name_col is not None and mt_name_col < len(row) else None)
@@ -520,6 +523,7 @@ async def ingest_duties_import_xlsx(db: AsyncSession, data: bytes) -> dict[str, 
         valid_to = _to_date(row[end_col] if end_col is not None and end_col < len(row) else None)
 
         legal_base = _to_str(row[legal_base_col] if legal_base_col is not None and legal_base_col < len(row) else None)
+        await ensure_origin(db, origin_code=origin, origin_name=origin_name_value)
 
         raw_row = {headers[i] if i < len(headers) else f"col_{i}": _to_str(v) for i, v in enumerate(row)}
         raw_row = {k: v for k, v in raw_row.items() if k and v is not None}
