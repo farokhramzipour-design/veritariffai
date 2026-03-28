@@ -46,6 +46,17 @@ def _as_decimal_rate(value: Any) -> Decimal | None:
     return None
 
 
+def _extract_rate(entry: dict[str, Any], key: str) -> Any:
+    if key in entry:
+        return entry.get(key)
+    alt = f"{key}_rate"
+    if alt in entry:
+        return entry.get(alt)
+    if key == "super_reduced" and "super_reduced_rate" in entry:
+        return entry.get("super_reduced_rate")
+    return None
+
+
 async def ingest() -> dict[str, Any]:
     started = datetime.utcnow()
     async with AsyncSessionMaker() as db:
@@ -70,7 +81,7 @@ async def ingest() -> dict[str, Any]:
                     continue
 
                 for rate_type in ("standard", "reduced", "reduced_alt", "super_reduced", "parking"):
-                    vat_rate = _as_decimal_rate(entry.get(rate_type))
+                    vat_rate = _as_decimal_rate(_extract_rate(entry, rate_type))
                     if vat_rate is None:
                         continue
 
@@ -86,7 +97,7 @@ async def ingest() -> dict[str, Any]:
                             valid_from=None,
                             valid_to=None,
                             source="euvatrates",
-                            raw_json={"country": country_code, "rate_type": rate_type, "value": entry.get(rate_type)},
+                            raw_json={"country": country_code, "rate_type": rate_type, "value": _extract_rate(entry, rate_type)},
                             ingested_at=datetime.utcnow(),
                         )
                         .on_conflict_do_update(
@@ -101,7 +112,7 @@ async def ingest() -> dict[str, Any]:
                             "vat_rate": vat_rate,
                             "valid_to": None,
                             "source": "euvatrates",
-                            "raw_json": {"country": country_code, "rate_type": rate_type, "value": entry.get(rate_type)},
+                            "raw_json": {"country": country_code, "rate_type": rate_type, "value": _extract_rate(entry, rate_type)},
                             "ingested_at": datetime.utcnow(),
                         },
                         )
