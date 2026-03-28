@@ -84,6 +84,20 @@ async def _fetch_all_pages(client: httpx.AsyncClient, url: str) -> list[dict[str
     return out
 
 
+def _get_self_link(obj: dict[str, Any]) -> str | None:
+    links = obj.get("links") if isinstance(obj.get("links"), dict) else {}
+    self_link = links.get("self")
+    return self_link if isinstance(self_link, str) and self_link else None
+
+
+def _get_related_link(obj: dict[str, Any], rel_name: str) -> str | None:
+    rels = obj.get("relationships") if isinstance(obj.get("relationships"), dict) else {}
+    rel = rels.get(rel_name) if isinstance(rels.get(rel_name), dict) else {}
+    links = rel.get("links") if isinstance(rel.get("links"), dict) else {}
+    related = links.get("related")
+    return related if isinstance(related, str) and related else None
+
+
 def _build_index(included: list[dict[str, Any]]) -> dict[str, dict[str, dict[str, Any]]]:
     index: dict[str, dict[str, dict[str, Any]]] = {}
     for obj in included:
@@ -416,44 +430,44 @@ async def _ingest_full(max_commodities: int | None) -> dict[str, Any]:
                         chapter_id = chapter.get("id")
                         if not isinstance(chapter_id, str) or not chapter_id:
                             continue
-                        c_rels = chapter.get("relationships") if isinstance(chapter.get("relationships"), dict) else {}
-                        headings_rel = c_rels.get("headings") if isinstance(c_rels.get("headings"), dict) else {}
-                        headings_link = (headings_rel.get("links") if isinstance(headings_rel.get("links"), dict) else {}).get("related")
+                        headings_link = _get_related_link(chapter, "headings")
+                        chapter_detail: dict[str, Any] | None = None
+                        if not headings_link:
+                            self_link = _get_self_link(chapter)
+                            if self_link:
+                                chapter_detail = await _get_json_with_retries(
+                                    client,
+                                    self_link,
+                                    headers={"Accept": "application/vnd.hmrc.2.0+json"},
+                                )
+                                c_data = chapter_detail.get("data") if isinstance(chapter_detail.get("data"), dict) else {}
+                                headings_link = _get_related_link(c_data, "headings")
 
-                        if not (isinstance(headings_link, str) and headings_link):
-                            chapter_detail = await _get_json_with_retries(
-                                client,
-                                f"{_API_V2}/chapters/{chapter_id}",
-                                headers={"Accept": "application/vnd.hmrc.2.0+json"},
-                            )
-                            c_data = chapter_detail.get("data") if isinstance(chapter_detail.get("data"), dict) else {}
-                            c_rels = c_data.get("relationships") if isinstance(c_data.get("relationships"), dict) else {}
-                            headings_rel = c_rels.get("headings") if isinstance(c_rels.get("headings"), dict) else {}
-                            headings_link = (headings_rel.get("links") if isinstance(headings_rel.get("links"), dict) else {}).get("related")
-
-                        if isinstance(headings_link, str) and headings_link:
+                        heading_items: list[dict[str, Any]] = []
+                        if headings_link:
                             heading_items = await _fetch_all_pages(client, headings_link)
-                        else:
-                            heading_items = []
 
                         for heading in heading_items:
                             heading_id = heading.get("id")
                             if not isinstance(heading_id, str) or not heading_id:
                                 continue
-
-                            h_rels = heading.get("relationships") if isinstance(heading.get("relationships"), dict) else {}
-                            comm_rel = h_rels.get("commodities") if isinstance(h_rels.get("commodities"), dict) else {}
-                            comm_link = (comm_rel.get("links") if isinstance(comm_rel.get("links"), dict) else {}).get("related")
+                            comm_link = _get_related_link(heading, "commodities")
+                            heading_detail: dict[str, Any] | None = None
+                            if not comm_link:
+                                self_link = _get_self_link(heading)
+                                if self_link:
+                                    heading_detail = await _get_json_with_retries(
+                                        client,
+                                        self_link,
+                                        headers={"Accept": "application/vnd.hmrc.2.0+json"},
+                                    )
+                                    h_data = heading_detail.get("data") if isinstance(heading_detail.get("data"), dict) else {}
+                                    comm_link = _get_related_link(h_data, "commodities")
 
                             commodity_items: list[dict[str, Any]] = []
-                            if isinstance(comm_link, str) and comm_link:
+                            if comm_link:
                                 commodity_items = await _fetch_all_pages(client, comm_link)
-                            else:
-                                heading_detail = await _get_json_with_retries(
-                                    client,
-                                    f"{_API_V2}/headings/{heading_id}",
-                                    headers={"Accept": "application/vnd.hmrc.2.0+json"},
-                                )
+                            elif heading_detail:
                                 included = heading_detail.get("included") if isinstance(heading_detail.get("included"), list) else []
                                 commodity_items = [c for c in included if isinstance(c, dict)]
 

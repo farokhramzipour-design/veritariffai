@@ -77,7 +77,14 @@ async def _download_taric_xml(*, params: dict[str, str]) -> str:
                         "User-Agent": "veritariffai/1.0",
                     },
                 )
-                resp.raise_for_status()
+                try:
+                    resp.raise_for_status()
+                except httpx.HTTPStatusError as exc:
+                    snippet = (exc.response.text or "")[:800]
+                    ct = exc.response.headers.get("content-type")
+                    raise ValueError(
+                        f"TARIC download failed: HTTP {exc.response.status_code} content-type={ct} url={exc.request.url} body={snippet}"
+                    ) from None
                 content = resp.content
             is_gzip = content[:2] == b"\x1f\x8b"
             fd, path = tempfile.mkstemp(prefix="taric_", suffix=".xml")
