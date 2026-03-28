@@ -3,36 +3,46 @@ from celery import shared_task
 
 @shared_task(name="app.infrastructure.workers.tasks.ingest_taric_delta", queue="data_ingestion")
 def ingest_taric_delta():
+    from app.infrastructure.database.session import run_migrations_sync
     from app.infrastructure.ingestion.taric import ingest_delta_sync
 
+    run_migrations_sync(raise_on_error=True)
     return ingest_delta_sync()
 
 
 @shared_task(name="app.infrastructure.workers.tasks.ingest_taric_full", queue="data_ingestion")
 def ingest_taric_full():
+    from app.infrastructure.database.session import run_migrations_sync
     from app.infrastructure.ingestion.taric import ingest_full_sync
 
+    run_migrations_sync(raise_on_error=True)
     return ingest_full_sync()
 
 
 @shared_task(name="app.infrastructure.workers.tasks.ingest_ukgt_delta", queue="data_ingestion")
 def ingest_ukgt_delta():
+    from app.infrastructure.database.session import run_migrations_sync
     from app.infrastructure.ingestion.ukgt import ingest_delta_sync
 
+    run_migrations_sync(raise_on_error=True)
     return ingest_delta_sync()
 
 
 @shared_task(name="app.infrastructure.workers.tasks.ingest_ukgt_full", queue="data_ingestion")
 def ingest_ukgt_full():
+    from app.infrastructure.database.session import run_migrations_sync
     from app.infrastructure.ingestion.ukgt import ingest_full_sync
 
+    run_migrations_sync(raise_on_error=True)
     return ingest_full_sync()
 
 
 @shared_task(name="app.infrastructure.workers.tasks.ingest_eu_vat", queue="data_ingestion")
 def ingest_eu_vat():
+    from app.infrastructure.database.session import run_migrations_sync
     from app.infrastructure.ingestion.eu_vat import ingest_sync
 
+    run_migrations_sync(raise_on_error=True)
     return ingest_sync()
 
 
@@ -44,8 +54,10 @@ def ingest_taric_xlsx_from_url(kind: str, url: str):
     import httpx
 
     from app.infrastructure.database.models import IngestionRun
-    from app.infrastructure.database.session import AsyncSessionMaker
+    from app.infrastructure.database.session import AsyncSessionMaker, run_migrations_sync
     from app.infrastructure.ingestion.taric_xlsx import ingest_duties_import_xlsx, ingest_nomenclature_en_xlsx
+
+    run_migrations_sync(raise_on_error=True)
 
     async def _download_bytes(remote_url: str, *, max_bytes: int) -> bytes:
         backoff_s = 0.75
@@ -102,13 +114,17 @@ def ingest_taric_xlsx_from_url(kind: str, url: str):
 
 @shared_task(name="app.infrastructure.workers.tasks.ingest_fx_hmrc", queue="data_ingestion")
 def ingest_fx_hmrc():
+    from app.infrastructure.database.session import run_migrations_sync
     from app.infrastructure.ingestion.fx import ingest_hmrc_monthly
 
+    run_migrations_sync(raise_on_error=True)
     return ingest_hmrc_monthly()
 
 
 @shared_task(name="app.infrastructure.workers.tasks.ingest_fx_ecb", queue="data_ingestion")
 def ingest_fx_ecb():
+    from app.infrastructure.database.session import run_migrations_sync
     from app.infrastructure.ingestion.fx import ingest_ecb_daily
 
+    run_migrations_sync(raise_on_error=True)
     return ingest_ecb_daily()

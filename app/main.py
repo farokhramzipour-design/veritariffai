@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.core.logging_config import configure_logging
+from app.infrastructure.database.session import run_migrations_sync
 
 # Configure logging before anything else imports a logger
 configure_logging(
@@ -21,32 +22,9 @@ from app.core.middleware import RateLimitMiddleware, RequestLoggingMiddleware
 logger = logging.getLogger(__name__)
 
 
-def _run_migrations() -> None:
-    """Apply all pending Alembic migrations synchronously at startup."""
-    try:
-        from alembic.config import Config
-        from alembic import command
-        from app.infrastructure.database.session import _build_db_url
-
-        alembic_cfg = Config("alembic.ini")
-        # Build a synchronous URL from the same settings used by the async engine.
-        # asyncpg  → psycopg  (psycopg3 sync driver, already in requirements)
-        sync_url = (
-            _build_db_url()
-            .replace("postgresql+asyncpg://", "postgresql+psycopg://")
-            .replace("postgres+asyncpg://", "postgresql+psycopg://")
-        )
-        logger.info("Running migrations against: %s", sync_url.split("@")[-1])  # hide credentials
-        alembic_cfg.set_main_option("sqlalchemy.url", sync_url)
-        command.upgrade(alembic_cfg, "head")
-        logger.info("Alembic migrations applied successfully.")
-    except Exception:
-        logger.exception("Failed to apply Alembic migrations — the app will still start.")
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    _run_migrations()
+    run_migrations_sync()
     yield
 
 
