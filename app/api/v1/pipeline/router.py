@@ -54,6 +54,30 @@ async def trigger_pipeline(
     return ok({"accepted": True, "source": source, "task_id": str(r.id)})
 
 
+@router.post("/trigger/eu_vat")
+async def trigger_eu_vat():
+    from app.infrastructure.workers.celery_app import celery_app
+
+    r = celery_app.send_task("app.infrastructure.workers.tasks.ingest_eu_vat", kwargs={})
+    return ok({"accepted": True, "source": "eu_vat", "task_id": str(r.id)})
+
+
+@router.post("/trigger/uk_tariff")
+async def trigger_uk_tariff():
+    from app.infrastructure.workers.celery_app import celery_app
+
+    r = celery_app.send_task("app.infrastructure.workers.tasks.ingest_ukgt_delta", kwargs={})
+    return ok({"accepted": True, "source": "uk_tariff", "task_id": str(r.id)})
+
+
+@router.post("/trigger/eu_taric")
+async def trigger_eu_taric():
+    from app.infrastructure.workers.celery_app import celery_app
+
+    r = celery_app.send_task("app.infrastructure.workers.tasks.ingest_taric_delta", kwargs={})
+    return ok({"accepted": True, "source": "eu_taric", "task_id": str(r.id)})
+
+
 @router.get("/logs")
 async def pipeline_logs(
     source: str | None = Query(None),
