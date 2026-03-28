@@ -12,7 +12,7 @@ import sqlalchemy as sa
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.infrastructure.database.models import TariffMeasure, VATRate
+from app.infrastructure.database.models import HSCode, TariffMeasure, VATRate
 from app.infrastructure.database.session import get_session
 from app.utils.country import is_eu
 
@@ -290,6 +290,15 @@ async def _pick_vat(
     return res.scalar_one_or_none()
 
 
+def _split_currency(unit: str | None) -> str | None:
+    if not unit:
+        return None
+    u = unit.strip().upper()
+    if len(u) >= 3 and u[:3].isalpha():
+        return u[:3]
+    return None
+
+
 @router.get("/lookup")
 async def tariff_lookup(
     hs_code: str = Query(...),
@@ -310,13 +319,33 @@ async def tariff_lookup(
     duty = await _pick_best_duty(db, hs_code=hs, market=market, origin=origin_cc)
     vat = await _pick_vat(db, hs_code=hs, market=market, country_code=dest_cc)
 
+    res = await db.execute(select(HSCode.description).where(HSCode.code == hs).limit(1))
+    description = res.scalar_one_or_none() or f"HS {hs}"
+
+    duty_amount = float(duty.rate_specific_amount) if duty and duty.rate_specific_amount is not None else None
+    duty_currency = _split_currency(duty.rate_specific_unit) if duty and duty.rate_specific_unit else None
+
     payload = {
         "hs_code": hs,
+        "description": description,
         "origin_country": origin_cc,
         "destination_country": dest_cc,
         "destination_market": market,
-        "duty": None,
-        "vat": None,
+        "duty": {
+            "rate_type": duty.measure_type if duty else None,
+            "duty_rate": float(duty.rate_ad_valorem) if duty and duty.rate_ad_valorem is not None else None,
+            "duty_amount": duty_amount,
+            "currency": duty_currency,
+            "trade_agreement": duty.preferential_agreement if duty else None,
+            "source": duty.source_dataset if duty else None,
+        },
+        "vat": {
+            "country_code": vat.country_code if vat else dest_cc,
+            "rate_type": vat.rate_type if vat else None,
+            "vat_rate": float(vat.vat_rate) if vat else None,
+            "hs_code_prefix": vat.hs_code_prefix if vat else None,
+            "source": vat.source if vat else None,
+        },
         "calculated": {
             "duty_on_goods_value_pct": float(duty.rate_ad_valorem) if duty and duty.rate_ad_valorem is not None else None,
             "vat_applies_to": "goods_value + duty",
@@ -327,21 +356,5 @@ async def tariff_lookup(
             "vat_last_updated": vat.ingested_at.date().isoformat() if vat else None,
         },
     }
-
-    if duty:
-        payload["duty"] = {
-            "rate_type": duty.measure_type,
-            "duty_rate": float(duty.rate_ad_valorem) if duty.rate_ad_valorem is not None else None,
-            "trade_agreement": duty.preferential_agreement,
-            "source": duty.source_dataset,
-        }
-
-    if vat:
-        payload["vat"] = {
-            "country_code": vat.country_code,
-            "rate_type": vat.rate_type,
-            "vat_rate": float(vat.vat_rate),
-            "source": vat.source,
-        }
 
     return ok(payload)
