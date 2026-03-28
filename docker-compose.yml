@@ -3,13 +3,33 @@ version: '3.8'
 services:
   web:
     build: .
-    command: gunicorn app.main:app --workers 4 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000
     ports:
       - "8080:8000"
     env_file:
       - .env
     depends_on:
       - db
+      - redis
+    networks:
+      - app-network
+
+  worker:
+    build: .
+    command: celery -A app.infrastructure.workers.celery_app.celery_app worker -l info -Q data_ingestion --concurrency=2
+    env_file:
+      - .env
+    depends_on:
+      - db
+      - redis
+    networks:
+      - app-network
+
+  beat:
+    build: .
+    command: celery -A app.infrastructure.workers.celery_app.celery_app beat -l info
+    env_file:
+      - .env
+    depends_on:
       - redis
     networks:
       - app-network
