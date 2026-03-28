@@ -5,6 +5,7 @@ import os
 from contextlib import contextmanager
 from datetime import datetime
 from fastapi import APIRouter, Depends, File, Path, Query, UploadFile
+import httpx
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -229,3 +230,66 @@ async def taric_xlsx_import(
         run.completed_at = datetime.utcnow()
         await db.commit()
         return ok({"accepted": False, "kind": kind, "error": str(exc)})
+
+
+async def _download_bytes(url: str, *, max_bytes: int) -> bytes:
+    backoff_s = 0.75
+    last_exc: Exception | None = None
+    for _ in range(3):
+        try:
+            async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
+                async with client.stream("GET", url, headers={"Accept": "*/*"}) as resp:
+                    resp.raise_for_status()
+                    buf = bytearray()
+                    async for chunk in resp.aiter_bytes():
+                        buf.extend(chunk)
+                        if len(buf) > max_bytes:
+                            raise ValueError("Remote file too large")
+                    return bytes(buf)
+        except Exception as exc:
+            last_exc = exc
+            await asyncio.sleep(backoff_s)
+            backoff_s *= 2
+    raise last_exc or RuntimeError("Download failed")
+
+
+@router.post("/taric/xlsx/import-from-url")
+async def taric_xlsx_import_from_url(
+    kind: str = Query(..., description="duties_import | nomenclature_en"),
+    url: str = Query(...),
+    db: AsyncSession = Depends(get_session),
+):
+    if not (url.startswith("https://") or url.startswith("http://")):
+        return ok({"accepted": False, "error": "url must start with http(s)://"})
+
+    kind = kind.strip().lower()
+    run = IngestionRun(source="TARIC", status="running", started_at=datetime.utcnow())
+    db.add(run)
+    await db.commit()
+    await db.refresh(run)
+
+    try:
+        data = await _download_bytes(url, max_bytes=80 * 1024 * 1024)
+        if kind == "duties_import":
+            from app.infrastructure.ingestion.taric_xlsx import ingest_duties_import_xlsx
+
+            result = await ingest_duties_import_xlsx(db, data)
+        elif kind == "nomenclature_en":
+            from app.infrastructure.ingestion.taric_xlsx import ingest_nomenclature_en_xlsx
+
+            result = await ingest_nomenclature_en_xlsx(db, data)
+        else:
+            return ok({"accepted": False, "error": "Unknown kind"})
+
+        run.status = "success"
+        run.records_processed = int(result.get("measures_upserted") or result.get("hs_codes_upserted") or 0)
+        run.completed_at = datetime.utcnow()
+        await db.commit()
+        return ok({"accepted": True, "kind": kind, "url": url, "result": result})
+    except Exception as exc:
+        await db.rollback()
+        run.status = "failed"
+        run.error_details = str(exc)
+        run.completed_at = datetime.utcnow()
+        await db.commit()
+        return ok({"accepted": False, "kind": kind, "url": url, "error": str(exc)})

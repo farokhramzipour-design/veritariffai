@@ -55,7 +55,13 @@ def _to_date(v: Any) -> date | None:
     try:
         return date.fromisoformat(s[:10])
     except Exception:
-        return None
+        pass
+    for fmt in ("%d-%m-%Y", "%d/%m/%Y", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(s[:10], fmt).date()
+        except Exception:
+            continue
+    return None
 
 
 def _to_decimal(v: Any) -> Decimal | None:
@@ -196,14 +202,13 @@ async def ingest_duties_import_xlsx(db: AsyncSession, data: bytes) -> dict[str, 
         raise ValueError("No sheets found")
     headers: list[str] = list(sheets[0].get("headers") or [])
 
-    code_col = _find_col(headers, must=["code"])
-    if code_col is None:
-        code_col = _find_col(headers, must=["goods"], any_of=["code", "taric", "nomenclature"])
-    origin_col = _find_col(headers, must=["geographical"], any_of=["area", "origin", "country", "id", "code"])
-    mt_id_col = _find_col(headers, must=["measure", "type"], any_of=["id", "code"])
-    mt_name_col = _find_col(headers, must=["measure", "type"], any_of=["description", "name"])
-    duty_col = _find_col(headers, must=["duty"], any_of=["rate", "amount", "value"])
-    unit_col = _find_col(headers, must=["monetary"], any_of=["unit", "currency", "code"])
+    code_col = _find_col(headers, must=["goods", "code"]) or _find_col(headers, must=["code"])
+    origin_code_col = _find_col(headers, must=["origin", "code"])
+    origin_name_col = _find_col(headers, must=["origin"])
+    mt_code_col = _find_col(headers, must=["meas", "type", "code"]) or _find_col(headers, must=["measure", "type", "code"])
+    mt_name_col = _find_col(headers, must=["measure", "type"])
+    duty_col = _find_col(headers, must=["duty"])
+    legal_base_col = _find_col(headers, must=["legal", "base"])
     start_col = _find_col(headers, must=["start", "date"])
     end_col = _find_col(headers, must=["end", "date"])
 
@@ -225,14 +230,20 @@ async def ingest_duties_import_xlsx(db: AsyncSession, data: bytes) -> dict[str, 
         if not hs or len(hs) < 6:
             continue
 
-        origin_raw = _to_str(row[origin_col] if origin_col is not None and origin_col < len(row) else None)
         origin = None
-        if origin_raw:
-            o = origin_raw.strip().upper()
+        origin_code = _to_str(row[origin_code_col] if origin_code_col is not None and origin_code_col < len(row) else None)
+        if origin_code:
+            o = origin_code.strip().upper()
             if o not in {"1011", "ERGA OMNES", "ALL", "WORLD"}:
                 origin = o[:5]
+        else:
+            origin_raw = _to_str(row[origin_name_col] if origin_name_col is not None and origin_name_col < len(row) else None)
+            if origin_raw:
+                o = origin_raw.strip().upper()
+                if o not in {"1011", "ERGA OMNES", "ALL", "WORLD"}:
+                    origin = o[:5]
 
-        mt_id = _to_str(row[mt_id_col] if mt_id_col is not None and mt_id_col < len(row) else None)
+        mt_id = _to_str(row[mt_code_col] if mt_code_col is not None and mt_code_col < len(row) else None)
         mt_name = _to_str(row[mt_name_col] if mt_name_col is not None and mt_name_col < len(row) else None)
         measure_type = _measure_type_from_row(mt_id, mt_name)
         if not measure_type:
@@ -240,9 +251,10 @@ async def ingest_duties_import_xlsx(db: AsyncSession, data: bytes) -> dict[str, 
 
         duty_val = row[duty_col] if duty_col < len(row) else None
         rate = _to_decimal(duty_val)
-        currency = _to_str(row[unit_col] if unit_col is not None and unit_col < len(row) else None)
         valid_from = _to_date(row[start_col] if start_col is not None and start_col < len(row) else None) or date.today()
         valid_to = _to_date(row[end_col] if end_col is not None and end_col < len(row) else None)
+
+        legal_base = _to_str(row[legal_base_col] if legal_base_col is not None and legal_base_col < len(row) else None)
 
         raw_row = {headers[i] if i < len(headers) else f"col_{i}": _to_str(v) for i, v in enumerate(row)}
         raw_row = {k: v for k, v in raw_row.items() if k and v is not None}
@@ -252,11 +264,12 @@ async def ingest_duties_import_xlsx(db: AsyncSession, data: bytes) -> dict[str, 
         rate_ad_valorem: Decimal | None = None
         rate_specific_amount: Decimal | None = None
         rate_specific_unit: str | None = None
+        currency = None
         if isinstance(duty_val, str) and "%" in duty_val:
             rate_ad_valorem = rate
-        elif currency:
+        elif isinstance(duty_val, str) and "/" in duty_val:
             rate_specific_amount = rate
-            rate_specific_unit = currency
+            rate_specific_unit = duty_val.strip()
         else:
             rate_ad_valorem = rate
 
@@ -310,4 +323,3 @@ async def ingest_duties_import_xlsx(db: AsyncSession, data: bytes) -> dict[str, 
 
     await db.commit()
     return {"rows_seen": rows_seen, "measures_upserted": measures_upserted}
-
