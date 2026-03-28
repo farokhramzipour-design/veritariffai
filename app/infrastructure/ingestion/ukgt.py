@@ -414,68 +414,59 @@ async def _ingest_full(max_commodities: int | None) -> dict[str, Any]:
                         f"{_API_V2}/sections/{section_id}",
                         headers={"Accept": "application/vnd.hmrc.2.0+json"},
                     )
-                    s_data = section_detail.get("data") if isinstance(section_detail.get("data"), dict) else {}
-                    s_rels = s_data.get("relationships") if isinstance(s_data.get("relationships"), dict) else {}
-                    chapters_rel = s_rels.get("chapters") if isinstance(s_rels.get("chapters"), dict) else {}
-                    chapters_link = (chapters_rel.get("links") if isinstance(chapters_rel.get("links"), dict) else {}).get("related")
-
-                    if isinstance(chapters_link, str) and chapters_link:
-                        chapter_items = await _fetch_all_pages(client, chapters_link)
-                    else:
-                        chapter_ids = chapters_rel.get("data") if isinstance(chapters_rel.get("data"), list) else []
-                        chapter_ids_norm = [c.get("id") for c in chapter_ids if isinstance(c, dict) and isinstance(c.get("id"), str)]
-                        chapter_items = [{"id": cid} for cid in chapter_ids_norm]
-
-                    for chapter in chapter_items:
-                        chapter_id = chapter.get("id")
-                        if not isinstance(chapter_id, str) or not chapter_id:
+                    included = section_detail.get("included") if isinstance(section_detail.get("included"), list) else []
+                    chapters: list[str] = []
+                    for obj in included:
+                        if not isinstance(obj, dict) or obj.get("type") != "chapter":
                             continue
-                        headings_link = _get_related_link(chapter, "headings")
-                        chapter_detail: dict[str, Any] | None = None
-                        if not headings_link:
-                            self_link = _get_self_link(chapter)
-                            if self_link:
-                                chapter_detail = await _get_json_with_retries(
-                                    client,
-                                    self_link,
-                                    headers={"Accept": "application/vnd.hmrc.2.0+json"},
-                                )
-                                c_data = chapter_detail.get("data") if isinstance(chapter_detail.get("data"), dict) else {}
-                                headings_link = _get_related_link(c_data, "headings")
+                        attrs = obj.get("attributes") if isinstance(obj.get("attributes"), dict) else {}
+                        gni = attrs.get("goods_nomenclature_item_id")
+                        if not isinstance(gni, str):
+                            continue
+                        chapter_code = _digits(gni)[:2]
+                        if chapter_code and len(chapter_code) == 2:
+                            chapters.append(chapter_code)
 
-                        heading_items: list[dict[str, Any]] = []
-                        if headings_link:
-                            heading_items = await _fetch_all_pages(client, headings_link)
-
-                        for heading in heading_items:
-                            heading_id = heading.get("id")
-                            if not isinstance(heading_id, str) or not heading_id:
+                    for chapter_code in sorted(set(chapters)):
+                        chapter_detail = await _get_json_with_retries(
+                            client,
+                            f"{_API_V2}/chapters/{chapter_code}",
+                            headers={"Accept": "application/vnd.hmrc.2.0+json"},
+                        )
+                        c_included = chapter_detail.get("included") if isinstance(chapter_detail.get("included"), list) else []
+                        headings: list[str] = []
+                        for obj in c_included:
+                            if not isinstance(obj, dict) or obj.get("type") != "heading":
                                 continue
-                            comm_link = _get_related_link(heading, "commodities")
-                            heading_detail: dict[str, Any] | None = None
-                            if not comm_link:
-                                self_link = _get_self_link(heading)
-                                if self_link:
-                                    heading_detail = await _get_json_with_retries(
-                                        client,
-                                        self_link,
-                                        headers={"Accept": "application/vnd.hmrc.2.0+json"},
-                                    )
-                                    h_data = heading_detail.get("data") if isinstance(heading_detail.get("data"), dict) else {}
-                                    comm_link = _get_related_link(h_data, "commodities")
+                            attrs = obj.get("attributes") if isinstance(obj.get("attributes"), dict) else {}
+                            gni = attrs.get("goods_nomenclature_item_id")
+                            if not isinstance(gni, str):
+                                continue
+                            heading_code = _digits(gni)[:4]
+                            if heading_code and len(heading_code) == 4:
+                                headings.append(heading_code)
 
-                            commodity_items: list[dict[str, Any]] = []
-                            if comm_link:
-                                commodity_items = await _fetch_all_pages(client, comm_link)
-                            elif heading_detail:
-                                included = heading_detail.get("included") if isinstance(heading_detail.get("included"), list) else []
-                                commodity_items = [c for c in included if isinstance(c, dict)]
-
-                            for commodity in commodity_items:
-                                attrs = commodity.get("attributes") if isinstance(commodity.get("attributes"), dict) else {}
-                                if str(attrs.get("productline_suffix") or "") != "80":
+                        for heading_code in sorted(set(headings)):
+                            heading_detail = await _get_json_with_retries(
+                                client,
+                                f"{_API_V2}/headings/{heading_code}",
+                                headers={"Accept": "application/vnd.hmrc.2.0+json"},
+                            )
+                            h_included = heading_detail.get("included") if isinstance(heading_detail.get("included"), list) else []
+                            for obj in h_included:
+                                if not isinstance(obj, dict) or obj.get("type") != "commodity":
                                     continue
-                                code = attrs.get("goods_nomenclature_item_id") or commodity.get("id")
+                                attrs = obj.get("attributes") if isinstance(obj.get("attributes"), dict) else {}
+                                suffix = str(
+                                    attrs.get("productline_suffix")
+                                    or attrs.get("producline_suffix")
+                                    or ""
+                                )
+                                if suffix != "80":
+                                    continue
+                                if "declarable" in attrs and not bool(attrs.get("declarable")):
+                                    continue
+                                code = attrs.get("goods_nomenclature_item_id")
                                 if not isinstance(code, str):
                                     continue
                                 hs = _digits(code)
