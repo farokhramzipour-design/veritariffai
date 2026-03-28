@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.infrastructure.database.models import HSCode, IngestionRun, TariffMeasure, VATRate
 from app.infrastructure.database.session import AsyncSessionMaker
+from app.infrastructure.ingestion.duty_parser import parse_duty_expression, duty_to_human_readable
 
 
 _API_V2 = "https://www.trade-tariff.service.gov.uk/api/v2"
@@ -163,6 +164,11 @@ async def _upsert_measure(
     country_of_origin: str | None,
     preferential_agreement: str | None,
     rate_ad_valorem: Decimal | None,
+    rate_specific_amount: Decimal | None,
+    rate_specific_unit: str | None,
+    rate_minimum: Decimal | None,
+    rate_maximum: Decimal | None,
+    measure_condition: dict[str, Any] | None,
     raw_json: dict[str, Any] | None,
     valid_from: date,
     valid_to: date | None,
@@ -178,14 +184,14 @@ async def _upsert_measure(
             country_of_origin=country_of_origin,
             preferential_agreement=preferential_agreement,
             rate_ad_valorem=rate_ad_valorem,
-            rate_specific_amount=None,
-            rate_specific_unit=None,
-            rate_minimum=None,
-            rate_maximum=None,
+            rate_specific_amount=rate_specific_amount,
+            rate_specific_unit=rate_specific_unit,
+            rate_minimum=rate_minimum,
+            rate_maximum=rate_maximum,
             agricultural_component=None,
             quota_id=None,
             suspension=suspension,
-            measure_condition=None,
+            measure_condition=measure_condition,
             raw_json=raw_json,
             valid_from=valid_from,
             valid_to=valid_to,
@@ -203,7 +209,12 @@ async def _upsert_measure(
                 "country_of_origin": country_of_origin,
                 "preferential_agreement": preferential_agreement,
                 "rate_ad_valorem": rate_ad_valorem,
+                "rate_specific_amount": rate_specific_amount,
+                "rate_specific_unit": rate_specific_unit,
+                "rate_minimum": rate_minimum,
+                "rate_maximum": rate_maximum,
                 "suspension": suspension,
+                "measure_condition": measure_condition,
                 "raw_json": raw_json,
                 "valid_from": valid_from,
                 "valid_to": valid_to,
@@ -297,7 +308,51 @@ async def _ingest_commodity(db: AsyncSession, client: httpx.AsyncClient, hs_code
             if isinstance(de_attrs.get("base"), str):
                 rate_text = de_attrs.get("base")
 
-        rate_pct = _parse_pct(rate_text if isinstance(rate_text, str) else None)
+        parsed = parse_duty_expression(rate_text if isinstance(rate_text, str) else None)
+        rate_pct = parsed.duty_rate
+        rate_specific_amount = parsed.duty_amount
+        rate_specific_unit = f"{parsed.currency}/{parsed.duty_unit}" if parsed.currency and parsed.duty_unit else None
+        rate_minimum = parsed.duty_min_amount
+        rate_maximum = parsed.duty_max_amount
+        duty_meta: dict[str, Any] = {
+            "raw_expression": parsed.raw_expression,
+            "duty_expression_code": parsed.duty_expression_code,
+            "duty_unit": parsed.duty_unit,
+            "duty_unit_secondary": parsed.duty_unit_secondary,
+            "duty_amount_secondary": str(parsed.duty_amount_secondary) if parsed.duty_amount_secondary is not None else None,
+            "duty_min_amount": str(parsed.duty_min_amount) if parsed.duty_min_amount is not None else None,
+            "duty_max_amount": str(parsed.duty_max_amount) if parsed.duty_max_amount is not None else None,
+            "duty_min_rate": str(parsed.duty_min_rate) if parsed.duty_min_rate is not None else None,
+            "duty_max_rate": str(parsed.duty_max_rate) if parsed.duty_max_rate is not None else None,
+            "duty_max_total_rate": str(parsed.duty_max_total_rate) if parsed.duty_max_total_rate is not None else None,
+            "duty_expression_code_suffix": parsed.duty_expression_code_suffix,
+            "duty_rate_flag": parsed.duty_rate_flag,
+            "duty_measurement_basis": parsed.duty_measurement_basis,
+            "duty_gross_weight_basis": parsed.duty_gross_weight_basis,
+            "has_entry_price": parsed.has_entry_price,
+            "entry_price_type": parsed.entry_price_type,
+            "entry_price_max_rate": str(parsed.entry_price_max_rate) if parsed.entry_price_max_rate is not None else None,
+            "entry_price_max_additional_type": parsed.entry_price_max_additional_type,
+            "entry_price_max_specific": str(parsed.entry_price_max_specific) if parsed.entry_price_max_specific is not None else None,
+            "is_nihil": parsed.is_nihil,
+            "is_alcohol_duty": parsed.is_alcohol_duty,
+            "requires_import_licence": parsed.requires_import_licence,
+            "anti_dumping_specific": parsed.anti_dumping_specific,
+            "duty_per_item": parsed.duty_per_item,
+            "duty_per_article": parsed.duty_per_article,
+            "duty_suspended_to": str(parsed.duty_suspended_to) if parsed.duty_suspended_to is not None else None,
+            "duty_full_amount": str(parsed.duty_full_amount) if parsed.duty_full_amount is not None else None,
+            "siv_bands": parsed.siv_bands,
+            "weight_threshold_bands": parsed.weight_threshold_bands,
+            "reduction_bands": parsed.reduction_bands,
+            "quantity_threshold_bands": parsed.quantity_threshold_bands,
+            "value_threshold_bands": parsed.value_threshold_bands,
+            "unit_price_threshold_bands": parsed.unit_price_threshold_bands,
+            "count_threshold_bands": parsed.count_threshold_bands,
+            "parse_errors": parsed.parse_errors,
+            "human_readable": parsed.human_readable or duty_to_human_readable(parsed),
+        }
+        measure_condition = {"duty": duty_meta} if duty_meta else None
 
         valid_from = None
         valid_to = None
@@ -341,6 +396,11 @@ async def _ingest_commodity(db: AsyncSession, client: httpx.AsyncClient, hs_code
             country_of_origin=origin,
             preferential_agreement=trade_agreement,
             rate_ad_valorem=rate_pct,
+            rate_specific_amount=rate_specific_amount,
+            rate_specific_unit=rate_specific_unit,
+            rate_minimum=rate_minimum,
+            rate_maximum=rate_maximum,
+            measure_condition=measure_condition,
             raw_json={"measure": measure},
             valid_from=valid_from,
             valid_to=valid_to,

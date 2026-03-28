@@ -252,6 +252,45 @@ class VATRate(Base):
 Index("idx_vat_rates_country", VATRate.country_code)
 Index("idx_vat_rates_lookup", VATRate.country_code, VATRate.jurisdiction, VATRate.hs_code_prefix)
 
+# ---------- tariff.certificate_codes ----------
+
+
+class CertificateCode(Base):
+    __tablename__ = "certificate_codes"
+    __table_args__ = {"schema": "tariff"}
+
+    code: Mapped[str] = mapped_column(String(10), primary_key=True)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    category: Mapped[Optional[str]] = mapped_column(String(30))
+    last_updated: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+
+# ---------- tariff.pipeline_config ----------
+
+
+class PipelineConfig(Base):
+    __tablename__ = "pipeline_config"
+    __table_args__ = {"schema": "tariff"}
+
+    key: Mapped[str] = mapped_column(String(50), primary_key=True)
+    value: Mapped[Optional[str]] = mapped_column(Text)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+
+# ---------- tariff.duty_units ----------
+
+
+class DutyUnit(Base):
+    __tablename__ = "duty_units"
+    __table_args__ = {"schema": "tariff"}
+
+    code: Mapped[str] = mapped_column(String(10), primary_key=True)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    category: Mapped[Optional[str]] = mapped_column(String(20))
+    base_si_unit: Mapped[Optional[str]] = mapped_column(String(10))
+    conversion_to_si: Mapped[Optional[Decimal]] = mapped_column(NUMERIC(18, 8))
+    last_updated: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
 # ---------- tariff.tariff_quotas ----------
 
 

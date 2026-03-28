@@ -154,6 +154,16 @@ async def pipeline_logs(
     ])
 
 
+@router.post("/bootstrap")
+async def pipeline_bootstrap(db: AsyncSession = Depends(get_session)):
+    from app.infrastructure.ingestion.certificates import seed_certificate_codes
+    from app.infrastructure.ingestion.duty_units import seed_duty_units
+
+    certs = await seed_certificate_codes(db)
+    units = await seed_duty_units(db)
+    return ok({"certificate_codes": certs, "duty_units": units})
+
+
 @router.get("/celery/ping")
 async def celery_ping():
     from app.infrastructure.workers.celery_app import celery_app

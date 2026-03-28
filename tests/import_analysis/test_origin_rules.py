@@ -11,7 +11,7 @@ from app.services.origin_rules_service import evaluate
 
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return asyncio.run(coro)
 
 
 class TestOriginRulesService:

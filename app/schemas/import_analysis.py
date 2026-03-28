@@ -59,15 +59,15 @@ class ImportAnalysisRequest(BaseModel):
         None, description="Technical specification or additional detail beyond the product description."
     )
 
-    @field_validator("origin_country", "destination_country")
+    @field_validator("origin_country", "destination_country", mode="before")
     @classmethod
     def uppercase_iso(cls, v: str) -> str:
-        return v.strip().upper()
+        return str(v).strip().upper()
 
-    @field_validator("currency")
+    @field_validator("currency", mode="before")
     @classmethod
     def uppercase_currency(cls, v: str) -> str:
-        return v.strip().upper()
+        return str(v).strip().upper()
 
 
 # ---------------------------------------------------------------------------

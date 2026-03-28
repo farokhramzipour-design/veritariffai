@@ -15,7 +15,11 @@ from openpyxl import load_workbook
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.infrastructure.database.models import HSCode, TariffMeasure
+from app.infrastructure.database.models import CertificateCode, DutyUnit, HSCode, TariffMeasure
+from app.infrastructure.ingestion.duty_parser import (
+    duty_to_human_readable,
+    parse_duty_expression,
+)
 
 
 def _norm(s: str) -> str:
@@ -119,6 +123,202 @@ def _parse_duty_cell(duty_val: Any) -> tuple[Decimal | None, Decimal | None, str
     return None, None, None
 
 
+def _parse_condition_blocks(duty_text: str) -> list[dict[str, Any]]:
+    text = duty_text.strip()
+    if not text.lower().startswith("cond:"):
+        return []
+    body = text.split(":", 1)[1]
+    parts = [p.strip() for p in body.split(";") if p.strip()]
+
+    def logic_for(ctype: str) -> str:
+        t = ctype.upper()
+        if t in {"A", "B", "C", "D", "E", "O"}:
+            return "ALL_REQUIRED"
+        if t in {"N", "Y"}:
+            return "ANY_SUFFICIENT"
+        if t in {"H", "I", "Z"}:
+            return "INFORMATIONAL"
+        if t in {"F"}:
+            return "CONDITIONAL"
+        if t in {"J", "L", "M", "Q", "R", "U", "V", "X"}:
+            return "THRESHOLD"
+        if t in {"S"}:
+            return "REQUIRED"
+        return "UNKNOWN"
+
+    parsed_all = parse_duty_expression(text)
+    out: list[dict[str, Any]] = []
+    seq = 0
+
+    if parsed_all.siv_bands:
+        out.append(
+            {
+                "condition_type": "V",
+                "condition_logic": "THRESHOLD",
+                "certificate_code": None,
+                "duty_expression_code": None,
+                "threshold_data": parsed_all.siv_bands,
+                "is_threshold_condition": True,
+                "sequence_number": seq,
+            }
+        )
+        seq += 1
+    if parsed_all.weight_threshold_bands:
+        out.append(
+            {
+                "condition_type": "R",
+                "condition_logic": "THRESHOLD",
+                "certificate_code": None,
+                "duty_expression_code": None,
+                "threshold_data": parsed_all.weight_threshold_bands,
+                "is_threshold_condition": True,
+                "sequence_number": seq,
+            }
+        )
+        seq += 1
+    if parsed_all.quantity_threshold_bands:
+        out.append(
+            {
+                "condition_type": "J",
+                "condition_logic": "THRESHOLD",
+                "certificate_code": None,
+                "duty_expression_code": None,
+                "threshold_data": parsed_all.quantity_threshold_bands,
+                "is_threshold_condition": True,
+                "sequence_number": seq,
+            }
+        )
+        seq += 1
+    if parsed_all.value_threshold_bands:
+        out.append(
+            {
+                "condition_type": "M",
+                "condition_logic": "THRESHOLD",
+                "certificate_code": None,
+                "duty_expression_code": None,
+                "threshold_data": parsed_all.value_threshold_bands,
+                "is_threshold_condition": True,
+                "sequence_number": seq,
+            }
+        )
+        seq += 1
+    if parsed_all.unit_price_threshold_bands:
+        out.append(
+            {
+                "condition_type": "U",
+                "condition_logic": "THRESHOLD",
+                "certificate_code": None,
+                "duty_expression_code": None,
+                "threshold_data": parsed_all.unit_price_threshold_bands,
+                "is_threshold_condition": True,
+                "sequence_number": seq,
+            }
+        )
+        seq += 1
+    if parsed_all.count_threshold_bands:
+        out.append(
+            {
+                "condition_type": "X",
+                "condition_logic": "THRESHOLD",
+                "certificate_code": None,
+                "duty_expression_code": None,
+                "threshold_data": parsed_all.count_threshold_bands,
+                "is_threshold_condition": True,
+                "sequence_number": seq,
+            }
+        )
+        seq += 1
+    if parsed_all.reduction_bands:
+        out.append(
+            {
+                "condition_type": "L",
+                "condition_logic": "THRESHOLD",
+                "certificate_code": None,
+                "duty_expression_code": None,
+                "threshold_data": parsed_all.reduction_bands,
+                "is_threshold_condition": True,
+                "sequence_number": seq,
+            }
+        )
+        seq += 1
+    if parsed_all.duty_full_amount is not None or parsed_all.duty_suspended_to is not None:
+        out.append(
+            {
+                "condition_type": "F",
+                "condition_logic": "CONDITIONAL",
+                "certificate_code": None,
+                "duty_expression_code": None,
+                "suspension_full_amount": str(parsed_all.duty_full_amount) if parsed_all.duty_full_amount is not None else None,
+                "suspension_reduced_amount": str(parsed_all.duty_suspended_to) if parsed_all.duty_suspended_to is not None else None,
+                "is_threshold_condition": False,
+                "sequence_number": seq,
+            }
+        )
+        seq += 1
+
+    for p in parts:
+        m = re.search(
+            r"^(?P<ctype>[A-Z])(?:\s+cert:\s+(?P<cert>[A-Z]-\d{3}))?\s*\((?P<expr>\d{2})\)\s*:\s*(?P<val>.*)$",
+            p,
+            flags=re.IGNORECASE,
+        )
+        if not m:
+            continue
+        ctype = m.group("ctype").upper()
+        if ctype in {"V", "R", "L", "J", "M", "U", "X", "F"}:
+            continue
+        cert = m.group("cert")
+        expr = m.group("expr")
+        val = m.group("val").strip()
+
+        parsed_val = parse_duty_expression(val) if val else None
+        duty_rate = float(parsed_val.duty_rate) if parsed_val and parsed_val.duty_rate is not None else None
+        duty_amount = float(parsed_val.duty_amount) if parsed_val and parsed_val.duty_amount is not None else None
+        duty_unit = parsed_val.duty_unit if parsed_val else None
+        currency = parsed_val.currency if parsed_val else None
+
+        item: dict[str, Any] = {
+            "condition_type": ctype,
+            "condition_logic": logic_for(ctype),
+            "certificate_code": cert,
+            "duty_expression_code": expr,
+            "duty_raw": val,
+            "sequence_number": seq,
+        }
+        if cert:
+            item["duty_rate_if_met"] = duty_rate
+            item["duty_amount_if_met"] = duty_amount
+            item["duty_unit_if_met"] = duty_unit
+            item["currency_if_met"] = currency
+        else:
+            item["duty_rate_if_not_met"] = duty_rate
+            item["duty_amount_if_not_met"] = duty_amount
+            item["duty_unit_if_not_met"] = duty_unit
+            item["currency_if_not_met"] = currency
+        seq += 1
+        out.append(item)
+
+    return out
+
+
+async def _ensure_certificate_code(db: AsyncSession, code: str) -> None:
+    stmt = (
+        insert(CertificateCode)
+        .values(code=code, description=f"Unknown — code {code}", category=None, last_updated=datetime.utcnow())
+        .on_conflict_do_nothing(index_elements=[CertificateCode.code])
+    )
+    await db.execute(stmt)
+
+
+async def _ensure_duty_unit(db: AsyncSession, code: str) -> None:
+    stmt = (
+        insert(DutyUnit)
+        .values(code=code, description=f"Unknown unit {code}", category=None, base_si_unit=None, conversion_to_si=None, last_updated=datetime.utcnow())
+        .on_conflict_do_nothing(index_elements=[DutyUnit.code])
+    )
+    await db.execute(stmt)
+
+
 def inspect_xlsx_bytes(data: bytes, *, max_rows: int = 5) -> dict[str, Any]:
     wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
     out: dict[str, Any] = {"sheets": []}
@@ -207,6 +407,9 @@ def _measure_type_from_row(mt_id: str | None, mt_name: str | None) -> str | None
             "552": "COUNTERVAILING",
             "112": "SUSPENSION",
             "115": "END_USE",
+            "122": "TARIFF_QUOTA",
+            "696": "SAFEGUARD",
+            "763": "IMPORT_CONTROL",
         }
         if mt_id in mapping:
             return mapping[mt_id]
@@ -222,6 +425,12 @@ def _measure_type_from_row(mt_id: str | None, mt_name: str | None) -> str | None
             return "SUSPENSION"
         if "preference" in t or "preferential" in t:
             return "PREFERENTIAL"
+        if "tariff" in t and "quota" in t:
+            return "TARIFF_QUOTA"
+        if "safeguard" in t:
+            return "SAFEGUARD"
+        if "import" in t and "control" in t:
+            return "IMPORT_CONTROL"
     return None
 
 
@@ -304,6 +513,8 @@ async def ingest_duties_import_xlsx(db: AsyncSession, data: bytes) -> dict[str, 
             continue
 
         duty_val = row[duty_col] if duty_col < len(row) else None
+        duty_text_cell = _to_str(duty_val)
+        parsed = parse_duty_expression(duty_text_cell)
         rate = _to_decimal(duty_val)
         valid_from = _to_date(row[start_col] if start_col is not None and start_col < len(row) else None) or date.today()
         valid_to = _to_date(row[end_col] if end_col is not None and end_col < len(row) else None)
@@ -315,14 +526,69 @@ async def ingest_duties_import_xlsx(db: AsyncSession, data: bytes) -> dict[str, 
         raw_digest = hashlib.sha256(json.dumps(raw_row, sort_keys=True).encode("utf-8")).hexdigest()
         source_measure_id = f"TARIC_XLSX:{raw_digest}"
 
-        rate_ad_valorem: Decimal | None
-        rate_specific_amount: Decimal | None
-        rate_specific_unit: str | None
-        rate_ad_valorem, rate_specific_amount, rate_specific_unit = _parse_duty_cell(duty_val)
+        rate_ad_valorem: Decimal | None = parsed.duty_rate
+        rate_specific_amount: Decimal | None = parsed.duty_amount
+        rate_specific_unit: str | None = None
+        if parsed.currency and parsed.duty_unit:
+            await _ensure_duty_unit(db, parsed.duty_unit)
+            rate_specific_unit = f"{parsed.currency}/{parsed.duty_unit}"
+        if parsed.currency and parsed.duty_unit_secondary:
+            await _ensure_duty_unit(db, parsed.duty_unit_secondary)
         if rate_ad_valorem is None and rate_specific_amount is None:
             rate_ad_valorem = rate
         if rate_specific_unit and len(rate_specific_unit) > 50:
             rate_specific_unit = None
+
+        conditions: list[dict[str, Any]] = []
+        duty_text = _to_str(raw_row.get("Duty"))
+        if duty_text:
+            conditions = _parse_condition_blocks(duty_text)
+            for c in conditions:
+                cc = c.get("certificate_code")
+                if isinstance(cc, str) and cc:
+                    await _ensure_certificate_code(db, cc)
+
+        measure_condition: dict[str, Any] | None = None
+        duty_meta: dict[str, Any] = {
+            "raw_expression": parsed.raw_expression,
+            "duty_expression_code": parsed.duty_expression_code,
+            "duty_unit": parsed.duty_unit,
+            "duty_unit_secondary": parsed.duty_unit_secondary,
+            "duty_amount_secondary": str(parsed.duty_amount_secondary) if parsed.duty_amount_secondary is not None else None,
+            "duty_min_amount": str(parsed.duty_min_amount) if parsed.duty_min_amount is not None else None,
+            "duty_max_amount": str(parsed.duty_max_amount) if parsed.duty_max_amount is not None else None,
+            "duty_min_rate": str(parsed.duty_min_rate) if parsed.duty_min_rate is not None else None,
+            "duty_max_rate": str(parsed.duty_max_rate) if parsed.duty_max_rate is not None else None,
+            "duty_max_total_rate": str(parsed.duty_max_total_rate) if parsed.duty_max_total_rate is not None else None,
+            "duty_expression_code_suffix": parsed.duty_expression_code_suffix,
+            "duty_rate_flag": parsed.duty_rate_flag,
+            "duty_measurement_basis": parsed.duty_measurement_basis,
+            "duty_gross_weight_basis": parsed.duty_gross_weight_basis,
+            "has_entry_price": parsed.has_entry_price,
+            "entry_price_type": parsed.entry_price_type,
+            "entry_price_max_rate": str(parsed.entry_price_max_rate) if parsed.entry_price_max_rate is not None else None,
+            "entry_price_max_additional_type": parsed.entry_price_max_additional_type,
+            "entry_price_max_specific": str(parsed.entry_price_max_specific) if parsed.entry_price_max_specific is not None else None,
+            "is_nihil": parsed.is_nihil,
+            "is_alcohol_duty": parsed.is_alcohol_duty,
+            "requires_import_licence": parsed.requires_import_licence,
+            "anti_dumping_specific": parsed.anti_dumping_specific,
+            "duty_per_item": parsed.duty_per_item,
+            "duty_per_article": parsed.duty_per_article,
+            "duty_suspended_to": str(parsed.duty_suspended_to) if parsed.duty_suspended_to is not None else None,
+            "duty_full_amount": str(parsed.duty_full_amount) if parsed.duty_full_amount is not None else None,
+            "siv_bands": parsed.siv_bands,
+            "weight_threshold_bands": parsed.weight_threshold_bands,
+            "reduction_bands": parsed.reduction_bands,
+            "quantity_threshold_bands": parsed.quantity_threshold_bands,
+            "value_threshold_bands": parsed.value_threshold_bands,
+            "unit_price_threshold_bands": parsed.unit_price_threshold_bands,
+            "count_threshold_bands": parsed.count_threshold_bands,
+            "parse_errors": parsed.parse_errors,
+            "human_readable": parsed.human_readable or duty_to_human_readable(parsed),
+        }
+        if conditions or duty_meta:
+            measure_condition = {"conditions": conditions, "duty": duty_meta}
 
         stmt = (
             insert(TariffMeasure)
@@ -336,12 +602,12 @@ async def ingest_duties_import_xlsx(db: AsyncSession, data: bytes) -> dict[str, 
                 rate_ad_valorem=rate_ad_valorem,
                 rate_specific_amount=rate_specific_amount,
                 rate_specific_unit=rate_specific_unit,
-                rate_minimum=None,
-                rate_maximum=None,
+                rate_minimum=parsed.duty_min_amount,
+                rate_maximum=parsed.duty_max_amount,
                 agricultural_component=None,
                 quota_id=None,
                 suspension=measure_type in {"SUSPENSION", "END_USE"},
-                measure_condition=None,
+                measure_condition=measure_condition,
                 raw_json=raw_row,
                 valid_from=valid_from,
                 valid_to=valid_to,
@@ -359,7 +625,10 @@ async def ingest_duties_import_xlsx(db: AsyncSession, data: bytes) -> dict[str, 
                     "rate_ad_valorem": rate_ad_valorem,
                     "rate_specific_amount": rate_specific_amount,
                     "rate_specific_unit": rate_specific_unit,
+                    "rate_minimum": parsed.duty_min_amount,
+                    "rate_maximum": parsed.duty_max_amount,
                     "suspension": measure_type in {"SUSPENSION", "END_USE"},
+                    "measure_condition": measure_condition,
                     "raw_json": raw_row,
                     "valid_from": valid_from,
                     "valid_to": valid_to,

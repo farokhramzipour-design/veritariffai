@@ -15,7 +15,7 @@ from app.adapters.vat_adapter import get_vat_data
 
 class TestTariffAdapter:
     def _run(self, coro):
-        return asyncio.get_event_loop().run_until_complete(coro)
+        return asyncio.run(coro)
 
     def test_cotton_trousers_cn_to_de(self):
         result = self._run(get_tariff_data("620342", "CN", "DE"))
@@ -49,7 +49,7 @@ class TestTariffAdapter:
 
 class TestVATAdapter:
     def _run(self, coro):
-        return asyncio.get_event_loop().run_until_complete(coro)
+        return asyncio.run(coro)
 
     def test_germany_standard_vat(self):
         result = self._run(get_vat_data("DE", "620342"))
