@@ -295,6 +295,52 @@ async def auth_academic_mock(
     })
 
 
+class DevTokenRequest(BaseModel):
+    email: str = "dev@veritariff.local"
+    name: Optional[str] = None
+    role: Optional[str] = None
+    plan: Optional[str] = "free"
+
+
+@router.post("/dev/token")
+async def auth_dev_token(
+    payload: DevTokenRequest,
+    db: AsyncSession = Depends(get_session),
+):
+    env = (settings.environment or "").lower()
+    if env not in {"local", "development"} and not settings.academic_mock_enabled:
+        raise HTTPException(status_code=403, detail="Dev token endpoint disabled")
+
+    user = await _upsert_user(
+        db,
+        google_sub=f"dev:{payload.email}",
+        email=payload.email,
+        display_name=payload.name or payload.email,
+    )
+    if payload.plan:
+        plan = payload.plan.lower().strip()
+        if plan not in {"free", "pro"}:
+            raise HTTPException(status_code=422, detail="plan must be 'free' or 'pro'")
+        if user.plan != plan:
+            user.plan = plan
+            await db.commit()
+            await db.refresh(user)
+
+    token = _build_token(user, extra={"role": payload.role or "researcher"})
+    return ok({
+        "access_token": token,
+        "token_type": "bearer",
+        "expires_in": 3600 * 24,
+        "user": {
+            "id": str(user.id),
+            "email": user.email,
+            "display_name": user.display_name,
+            "plan": user.plan,
+            "role": payload.role or "researcher",
+        },
+    })
+
+
 # ---------------------------------------------------------------------------
 # Session management
 # ---------------------------------------------------------------------------
