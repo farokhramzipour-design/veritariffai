@@ -103,3 +103,32 @@ async def pipeline_logs(
         }
         for r in runs
     ])
+
+
+@router.get("/celery/ping")
+async def celery_ping():
+    from app.infrastructure.workers.celery_app import celery_app
+
+    try:
+        replies = celery_app.control.ping(timeout=1.5)
+        return ok({"replies": replies})
+    except Exception as exc:
+        return ok({"replies": [], "error": str(exc)})
+
+
+@router.get("/celery/task/{task_id}")
+async def celery_task_status(task_id: str = Path(...)):
+    from app.infrastructure.workers.celery_app import celery_app
+
+    result = celery_app.AsyncResult(task_id)
+    payload: dict = {"task_id": task_id, "state": result.state, "ready": result.ready()}
+    if result.ready():
+        try:
+            payload["result"] = result.get(timeout=0.1)
+        except Exception as exc:
+            payload["result_error"] = str(exc)
+    else:
+        info = result.info
+        if info is not None:
+            payload["info"] = str(info)
+    return ok(payload)
