@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 import os
 from contextlib import contextmanager
-from fastapi import APIRouter, Depends, Path, Query
+from datetime import datetime
+from fastapi import APIRouter, Depends, File, Path, Query, UploadFile
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -177,3 +178,54 @@ async def celery_task_status(task_id: str = Path(...)):
         if info is not None:
             payload["info"] = str(info)
     return ok(payload)
+
+
+@router.post("/taric/xlsx/inspect")
+async def taric_xlsx_inspect(
+    file: UploadFile = File(...),
+    max_rows: int = Query(5, ge=1, le=20),
+):
+    data = await file.read()
+    from app.infrastructure.ingestion.taric_xlsx import inspect_xlsx
+
+    return ok(await inspect_xlsx(data, max_rows=max_rows))
+
+
+@router.post("/taric/xlsx/import")
+async def taric_xlsx_import(
+    kind: str = Query(..., description="duties_import | nomenclature_en"),
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_session),
+):
+    kind = kind.strip().lower()
+    data = await file.read()
+
+    run = IngestionRun(source="TARIC", status="running", started_at=datetime.utcnow())
+    db.add(run)
+    await db.commit()
+    await db.refresh(run)
+
+    try:
+        if kind == "duties_import":
+            from app.infrastructure.ingestion.taric_xlsx import ingest_duties_import_xlsx
+
+            result = await ingest_duties_import_xlsx(db, data)
+        elif kind == "nomenclature_en":
+            from app.infrastructure.ingestion.taric_xlsx import ingest_nomenclature_en_xlsx
+
+            result = await ingest_nomenclature_en_xlsx(db, data)
+        else:
+            return ok({"accepted": False, "error": "Unknown kind"})
+
+        run.status = "success"
+        run.records_processed = int(result.get("measures_upserted") or result.get("hs_codes_upserted") or 0)
+        run.completed_at = datetime.utcnow()
+        await db.commit()
+        return ok({"accepted": True, "kind": kind, "result": result})
+    except Exception as exc:
+        await db.rollback()
+        run.status = "failed"
+        run.error_details = str(exc)
+        run.completed_at = datetime.utcnow()
+        await db.commit()
+        return ok({"accepted": False, "kind": kind, "error": str(exc)})
