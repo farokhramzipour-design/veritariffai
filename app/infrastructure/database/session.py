@@ -28,6 +28,15 @@ AsyncSessionMaker = async_sessionmaker(engine, expire_on_commit=False, class_=As
 
 
 def _ensure_alembic_version_capacity(conn) -> None:
+    conn.execute(
+        sa.text(
+            """
+            CREATE TABLE IF NOT EXISTS public.alembic_version (
+              version_num varchar(128) NOT NULL PRIMARY KEY
+            )
+            """
+        )
+    )
     row = conn.execute(
         sa.text(
             """
@@ -40,11 +49,12 @@ def _ensure_alembic_version_capacity(conn) -> None:
         )
     ).fetchone()
     if not row:
+        conn.commit()
         return
     data_type, max_len = row[0], row[1]
-    if data_type == "character varying" and max_len is not None and int(max_len) < 64:
+    if data_type == "character varying" and max_len is not None and int(max_len) < 128:
         conn.execute(sa.text("ALTER TABLE public.alembic_version ALTER COLUMN version_num TYPE varchar(128)"))
-        conn.commit()
+    conn.commit()
 
 
 def reset_db_sync(*, include_public: bool = False) -> None:
