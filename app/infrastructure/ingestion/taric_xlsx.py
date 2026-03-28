@@ -222,6 +222,8 @@ async def ingest_duties_import_xlsx(db: AsyncSession, data: bytes) -> dict[str, 
 
     measures_upserted = 0
     rows_seen = 0
+    hs_codes_upserted = 0
+    seen_hs: set[str] = set()
 
     for row in rows:
         rows_seen += 1
@@ -229,6 +231,28 @@ async def ingest_duties_import_xlsx(db: AsyncSession, data: bytes) -> dict[str, 
         hs = _digits(code_raw)
         if not hs or len(hs) < 6:
             continue
+
+        if hs not in seen_hs:
+            stmt = (
+                insert(HSCode)
+                .values(
+                    code=hs,
+                    jurisdiction="EU",
+                    description=f"HS {hs}",
+                    parent_code=None,
+                    level=len(hs),
+                    supplementary_unit=None,
+                    valid_from=date.today(),
+                    valid_to=None,
+                )
+                .on_conflict_do_update(
+                    index_elements=[HSCode.code],
+                    set_={"jurisdiction": "EU", "level": len(hs), "valid_to": None},
+                )
+            )
+            await db.execute(stmt)
+            hs_codes_upserted += 1
+            seen_hs.add(hs)
 
         origin = None
         origin_code = _to_str(row[origin_code_col] if origin_code_col is not None and origin_code_col < len(row) else None)
@@ -322,4 +346,4 @@ async def ingest_duties_import_xlsx(db: AsyncSession, data: bytes) -> dict[str, 
             await db.commit()
 
     await db.commit()
-    return {"rows_seen": rows_seen, "measures_upserted": measures_upserted}
+    return {"rows_seen": rows_seen, "hs_codes_upserted": hs_codes_upserted, "measures_upserted": measures_upserted}
