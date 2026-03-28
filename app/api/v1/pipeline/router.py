@@ -6,12 +6,14 @@ from contextlib import contextmanager
 from datetime import datetime
 from fastapi import APIRouter, Depends, File, Path, Query, UploadFile
 import httpx
+import sqlalchemy as sa
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.responses import ok
-from app.infrastructure.database.models import IngestionRun
+from app.infrastructure.database.models import IngestionRun, TariffMeasure, VATRate
 from app.infrastructure.database.session import get_session
+from app.api.v1.tariff.router import _pick_best_duty
 
 
 router = APIRouter()
@@ -307,3 +309,62 @@ async def taric_xlsx_import_from_url(
         run.completed_at = datetime.utcnow()
         await db.commit()
         return ok({"accepted": False, "kind": kind, "url": url, "error": str(exc)})
+
+
+@router.get("/sample/complete")
+async def sample_complete_lookups(
+    destination_country: str = Query("DE"),
+    origin_country: str = Query("CN"),
+    limit: int = Query(10, ge=1, le=50),
+    db: AsyncSession = Depends(get_session),
+):
+    dest = destination_country.upper()
+    origin = origin_country.upper()
+    market = "EU" if dest not in {"GB", "UK"} else "GB"
+
+    hs_res = await db.execute(
+        select(TariffMeasure.hs_code)
+        .where(TariffMeasure.jurisdiction == market)
+        .order_by(sa.func.random())
+        .limit(limit * 5)
+    )
+    hs_codes = [r[0] for r in hs_res.all() if isinstance(r[0], str)]
+
+    vat_res = await db.execute(
+        select(VATRate)
+        .where(VATRate.jurisdiction == market, VATRate.country_code == dest)
+        .order_by(VATRate.ingested_at.desc())
+        .limit(1)
+    )
+    vat = vat_res.scalar_one_or_none()
+
+    out: list[dict] = []
+    for hs in hs_codes:
+        duty = await _pick_best_duty(db, hs_code=hs, market=market, origin=origin)
+        if not duty:
+            continue
+        out.append(
+            {
+                "hs_code": hs,
+                "destination_market": market,
+                "destination_country": dest,
+                "origin_country": origin,
+                "duty": {
+                    "rate_type": duty.measure_type,
+                    "duty_rate": float(duty.rate_ad_valorem) if duty.rate_ad_valorem is not None else None,
+                    "duty_amount": float(duty.rate_specific_amount) if duty.rate_specific_amount is not None else None,
+                    "rate_specific_unit": duty.rate_specific_unit,
+                    "source": duty.source_dataset,
+                },
+                "vat": {
+                    "country_code": vat.country_code if vat else dest,
+                    "rate_type": vat.rate_type if vat else None,
+                    "vat_rate": float(vat.vat_rate) if vat else None,
+                    "source": vat.source if vat else None,
+                },
+            }
+        )
+        if len(out) >= limit:
+            break
+
+    return ok({"count": len(out), "items": out})
