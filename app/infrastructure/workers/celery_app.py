@@ -9,6 +9,9 @@ celery_app = Celery(
     backend=(settings.celery_backend_url or settings.redis_url),
 )
 
+celery_app.autodiscover_tasks(["app.infrastructure.workers"])
+from app.infrastructure.workers import tasks as _tasks
+
 celery_app.conf.update(
     task_queues=None,
     task_default_queue="default",
