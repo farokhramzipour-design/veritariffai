@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-from app.api.v1.tariff.router import _measure_has_any_duty, _normalize_origin_iso2
+from app.api.v1.tariff.router import _hs_candidates, _measure_has_any_duty, _normalize_origin_iso2
 
 
 def test_measure_has_any_duty_true_when_is_nihil() -> None:
@@ -32,3 +32,10 @@ def test_measure_has_any_duty_false_when_no_signals() -> None:
 
 def test_normalize_origin_iso2_uk_to_gb() -> None:
     assert _normalize_origin_iso2("UK") == "GB"
+
+
+def test_hs_candidates_include_zero_filled_heading_and_chapter() -> None:
+    c = _hs_candidates("7208510000")
+    assert c[:3] == ["7208510000", "7208000000", "7200000000"]
+    assert "7208000000" in c
+    assert "7200000000" in c

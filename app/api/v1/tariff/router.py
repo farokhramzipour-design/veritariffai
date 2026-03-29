@@ -262,13 +262,17 @@ def _origin_specificity(origin_code: str | None) -> int:
 
 
 def _hs_candidates(hs_code: str) -> list[str]:
-    hs = _digits(hs_code)
-    candidates: list[str] = []
-    for n in (10, 8, 6, 4, 2):
-        if len(hs) >= n:
-            cand = hs[:n]
-            if cand and cand not in candidates:
-                candidates.append(cand)
+    hs_raw = _digits(hs_code)
+    if not hs_raw or len(hs_raw) < 2:
+        return []
+
+    hs10 = hs_raw[:10].ljust(10, "0")
+    candidates: list[str] = [hs10]
+    for n in (8, 6, 4, 2):
+        prefix = hs10[:n]
+        cand = prefix.ljust(10, "0")
+        if cand not in candidates:
+            candidates.append(cand)
     return candidates
 
 
