@@ -138,6 +138,9 @@ class HSClassificationResult(BaseModel):
 
 class RatesResult(BaseModel):
     duty_rate: Optional[float] = Field(None, description="MFN import duty rate (%).")
+    effective_duty_rate: Optional[float] = Field(
+        None, description="Effective duty rate (%) including stacked additional duties (safeguard/anti-dumping) when applicable."
+    )
     vat_rate: Optional[float] = Field(None, description="Import VAT / import tax rate (%).")
     preferential_duty_rate: Optional[float] = Field(
         None, description="Preferential duty rate (%) if the origin qualifies."
@@ -188,3 +191,7 @@ class ImportAnalysisResponse(BaseModel):
     compliance: ComplianceResult
     calculation: CalculationResult
     sources: list[SourceRecord]
+    tariff_lookup: Optional[dict[str, Any]] = Field(
+        None,
+        description="Raw tariff lookup report used for the calculation (same shape as /api/v1/tariff/lookup data).",
+    )

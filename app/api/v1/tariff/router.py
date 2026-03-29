@@ -626,17 +626,33 @@ async def _certificate_descriptions(db: AsyncSession, codes: list[str]) -> dict[
     res = await db.execute(select(CertificateCode).where(CertificateCode.code.in_(uniq)))
     rows = res.scalars().all()
     m = {r.code: r.description for r in rows}
+    seed_map: dict[str, tuple[str, str | None]] = {}
+    try:
+        from app.infrastructure.ingestion.certificates import _SEED
+
+        seed_map = {code: (desc, category) for code, desc, category in _SEED}
+    except Exception:
+        seed_map = {}
     missing = [c for c in uniq if c not in m]
     if missing:
-        stmt = (
-            sa.dialects.postgresql.insert(CertificateCode)
-            .values([{"code": c, "description": f"Certificate {c} — description pending", "category": "unknown"} for c in missing])
-            .on_conflict_do_nothing(index_elements=[CertificateCode.code])
+        values = []
+        for c in missing:
+            if c in seed_map:
+                desc, category = seed_map[c]
+                values.append({"code": c, "description": desc, "category": category, "last_updated": sa.text("now()")})
+                m[c] = desc
+            else:
+                values.append(
+                    {"code": c, "description": f"Certificate {c} — description pending", "category": "unknown", "last_updated": sa.text("now()")}
+                )
+                m[c] = f"Certificate {c} — description pending"
+        ins = sa.dialects.postgresql.insert(CertificateCode).values(values)
+        stmt = ins.on_conflict_do_update(
+            index_elements=[CertificateCode.code],
+            set_={"description": ins.excluded.description, "category": ins.excluded.category, "last_updated": sa.text("now()")},
         )
         await db.execute(stmt)
         await db.commit()
-        for c in missing:
-            m[c] = f"Certificate {c} — description pending"
     return m
 
 
@@ -923,15 +939,6 @@ async def tariff_lookup(
         duty_origin_name = _display_origin_name(duty_origin_code, origin_map.get(duty_origin_code))
 
     rate_basis = _rate_basis_for_measure(measure_type=duty.measure_type if duty else None, origin_code=duty_origin_code)
-    has_mfn_via_walkup = bool(duty and duty_origin_code == "1011" and origin_cc != "1011")
-    if has_mfn_via_walkup:
-        warnings.append(
-            f"{origin_cc} has no more specific EU duty measure for this HS code. The ERGA OMNES (MFN) rate applies."
-        )
-        if origin_cc == "GB" and market == "EU":
-            warnings.append(
-                "The UK is a third country to the EU. Standard third-country (MFN) duty applies unless a specific preferential measure exists for this HS code."
-            )
 
     measures_for_origin = [
         m
@@ -1078,15 +1085,15 @@ async def tariff_lookup(
     stacked_rows = [
         m
         for m in all_measures
-        if m.measure_type in ("SAFEGUARD", "ANTI_DUMPING", "COUNTERVAILING", "ADDITIONAL")
+        if m.measure_type in ("SAFEGUARD", "ANTI_DUMPING", "COUNTERVAILING", "ADDITIONAL", "IMPORT_CONTROL")
         and _measure_origin_code(m) in resolved_origin_codes
-        and _measure_has_any_duty(m)
+        and (_measure_has_any_duty(m) or m.measure_type == "IMPORT_CONTROL")
     ]
     stacked_measures = [_measure_record(m, market=market, origin_map=origin_map) for m in stacked_rows][:200]
 
     stacked_rate_sum = 0.0
     for m in stacked_rows:
-        if m.rate_ad_valorem is not None:
+        if m.measure_type in ("SAFEGUARD", "ANTI_DUMPING", "COUNTERVAILING", "ADDITIONAL") and m.rate_ad_valorem is not None:
             stacked_rate_sum += float(m.rate_ad_valorem)
 
     if effective_duty_rate is None:
@@ -1108,13 +1115,30 @@ async def tariff_lookup(
     if tariff_quotas_effective:
         tariff_quotas = tariff_quotas_effective
 
+    hs10 = hs[:10].ljust(10, "0")
+    mfn_best = None
+    mfn_candidates = [m for m in all_measures if m.measure_type == "MFN" and _measure_origin_code(m) == "1011"]
+    if mfn_candidates:
+        mfn_best = sorted(mfn_candidates, key=lambda m: (len(m.hs_code or ""), m.ingested_at), reverse=True)[0]
+
+    has_mfn_via_walkup = bool(mfn_best and (mfn_best.hs_code or "") != hs10)
     mfn_duty = None
-    if has_mfn_via_walkup and duty:
-        duty_meta_walk = _measure_duty_meta(duty)
+    if mfn_best:
+        duty_meta_walk = _measure_duty_meta(mfn_best)
         if duty_meta_walk and isinstance(duty_meta_walk.get("raw_expression"), str):
             mfn_duty = duty_meta_walk.get("raw_expression")
-        elif duty.rate_ad_valorem is not None:
-            mfn_duty = f"{float(duty.rate_ad_valorem):.3f} %"
+        elif mfn_best.rate_ad_valorem is not None:
+            mfn_duty = f"{float(mfn_best.rate_ad_valorem):.3f} %"
+
+    if has_mfn_via_walkup:
+        warnings.append(
+            f"{origin_cc} has no more specific EU duty measure at the 10-digit level. "
+            "Using MFN (ERGA OMNES 1011) from a parent heading/chapter."
+        )
+        if origin_cc == "GB" and market == "EU":
+            warnings.append(
+                "The UK is a third country to the EU. Standard third-country (MFN) duty applies unless a specific preferential measure exists for this HS code."
+            )
 
     payload = {
         "hs_code": hs,
@@ -1170,7 +1194,19 @@ async def tariff_lookup(
             "anti_dumping_specific": anti_dumping_specific,
             "siv_bands": siv_bands,
             "trade_agreement": duty.preferential_agreement if duty else None,
-            "financial_charge": True if duty else None,
+            "financial_charge": (
+                None
+                if duty is None
+                else (
+                    False
+                    if (
+                        (duty.rate_ad_valorem is None or float(duty.rate_ad_valorem) == 0.0)
+                        and duty_amount is None
+                        and duty_amount_secondary is None
+                    )
+                    else True
+                )
+            ),
             "source": duty.source_dataset if duty else None,
             "origin_code": duty_origin_code,
             "origin_name": duty_origin_name,

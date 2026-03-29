@@ -24,12 +24,12 @@ from app.schemas.import_analysis import (
     ImportAnalysisRequest,
     ImportAnalysisResponse,
     SourceRecord,
+    TariffData,
+    VATData,
 )
 from app.services import (
     hs_classifier_service,
     origin_rules_service,
-    tariff_service,
-    vat_service,
 )
 from app.utils import money as money_util
 
@@ -62,33 +62,72 @@ async def analyze(request: ImportAnalysisRequest) -> ImportAnalysisResponse:
 
     hs_code = classification.primary_hs_code
 
-    # ── Step 3: Tariff data (needed by origin rules, so fetched first) ────
-    tariff_data = await tariff_service.fetch(
-        hs_code=hs_code,
-        origin=request.origin_country,
-        destination=request.destination_country,
-    )
+    from app.infrastructure.database.session import AsyncSessionMaker
+    from app.api.v1.tariff.router import tariff_lookup as tariff_lookup_endpoint
 
-    # ── Steps 4 & 5: VAT + origin rules are independent — run concurrently ─
-    vat_data, origin_rules = await asyncio.gather(
-        vat_service.fetch(
-            destination=request.destination_country,
+    async with AsyncSessionMaker() as db:
+        lookup_envelope = await tariff_lookup_endpoint(
             hs_code=hs_code,
-        ),
-        origin_rules_service.evaluate(
             origin=request.origin_country,
             destination=request.destination_country,
-            hs_code=hs_code,
-            duty_rate=tariff_data.duty_rate,
-        ),
+            cif_price_eur_per_dtn=None,
+            full_report=False,
+            db=db,
+        )
+        lookup_data = lookup_envelope.get("data") if isinstance(lookup_envelope, dict) else None
+        if not isinstance(lookup_data, dict):
+            lookup_data = {}
+
+    duty_block = lookup_data.get("duty") if isinstance(lookup_data.get("duty"), dict) else {}
+    vat_block = lookup_data.get("vat") if isinstance(lookup_data.get("vat"), dict) else {}
+    calc_block = lookup_data.get("calculated") if isinstance(lookup_data.get("calculated"), dict) else {}
+
+    duty_rate = duty_block.get("duty_rate")
+    effective_duty_rate = calc_block.get("effective_duty_rate") if isinstance(calc_block.get("effective_duty_rate"), (int, float)) else None
+    if effective_duty_rate is None and isinstance(duty_rate, (int, float)):
+        effective_duty_rate = float(duty_rate)
+
+    vat_rate = vat_block.get("vat_rate")
+    if not isinstance(vat_rate, (int, float)):
+        vat_rate = None
+
+    certificate_codes = lookup_data.get("certificate_codes") if isinstance(lookup_data.get("certificate_codes"), list) else []
+    documents_required = [c for c in certificate_codes if isinstance(c, str) and c]
+    tariff_notes = calc_block.get("warnings") if isinstance(calc_block.get("warnings"), list) else []
+    tariff_notes = [w for w in tariff_notes if isinstance(w, str)]
+
+    tariff_data = TariffData(
+        duty_rate=float(duty_rate) if isinstance(duty_rate, (int, float)) else None,
+        anti_dumping=any(isinstance(m, dict) and m.get("measure_type") == "ANTI_DUMPING" for m in (lookup_data.get("stacked_measures") or [])),
+        anti_dumping_rate=None,
+        countervailing=any(isinstance(m, dict) and m.get("measure_type") == "COUNTERVAILING" for m in (lookup_data.get("stacked_measures") or [])),
+        countervailing_rate=None,
+        excise=False,
+        excise_rate=None,
+        other_measures=list(lookup_data.get("other_measures") or []),
+        documents_required=documents_required,
+        tariff_notes=tariff_notes,
+    )
+
+    vat_data = VATData(
+        vat_rate=float(vat_rate) if isinstance(vat_rate, (int, float)) else None,
+        vat_category=str(vat_block.get("rate_type") or "STANDARD").upper(),
+        vat_notes=[],
+    )
+
+    origin_rules = await origin_rules_service.evaluate(
+        origin=request.origin_country,
+        destination=request.destination_country,
+        hs_code=hs_code,
+        duty_rate=tariff_data.duty_rate,
     )
 
     # ── Step 6: Calculate landed cost ────────────────────────────────────
     calculation = _build_calculation(
         request=request,
-        duty_rate=tariff_data.duty_rate,
+        duty_rate=effective_duty_rate,
         vat_rate=vat_data.vat_rate,
-        preferential_rate=origin_rules.preferential_duty_rate if origin_rules.preferential_eligible else None,
+        preferential_rate=None,
     )
 
     # ── Step 7: Assemble response ─────────────────────────────────────────
@@ -96,12 +135,23 @@ async def analyze(request: ImportAnalysisRequest) -> ImportAnalysisResponse:
 
     rates_result = _build_rates(
         duty_rate=tariff_data.duty_rate,
+        effective_duty_rate=effective_duty_rate,
         vat_rate=vat_data.vat_rate,
         origin_rules=origin_rules,
     )
 
-    measures_result = tariff_service.to_measures(tariff_data)
-    compliance_result = tariff_service.to_compliance(tariff_data)
+    from app.schemas.import_analysis import MeasuresResult, ComplianceResult
+
+    measures_result = MeasuresResult(
+        anti_dumping=tariff_data.anti_dumping,
+        anti_dumping_rate=tariff_data.anti_dumping_rate,
+        countervailing=tariff_data.countervailing,
+        countervailing_rate=tariff_data.countervailing_rate,
+        excise=tariff_data.excise,
+        excise_rate=tariff_data.excise_rate,
+        other_measures=tariff_data.other_measures,
+    )
+    compliance_result = ComplianceResult(documents_required=tariff_data.documents_required, notes=tariff_data.tariff_notes)
 
     # Merge origin-rules notes into compliance
     if origin_rules.notes:
@@ -119,8 +169,7 @@ async def analyze(request: ImportAnalysisRequest) -> ImportAnalysisResponse:
             provider="OpenAI",
             model=settings.openai_classification_model,
         ),
-        SourceRecord(type="tariff_data", provider="tariff_adapter"),
-        SourceRecord(type="vat_data", provider="vat_adapter"),
+        SourceRecord(type="tariff_lookup", provider="internal_db"),
     ]
 
     logger.info(
@@ -140,18 +189,21 @@ async def analyze(request: ImportAnalysisRequest) -> ImportAnalysisResponse:
         compliance=compliance_result,
         calculation=calculation,
         sources=sources,
+        tariff_lookup=lookup_data,
     )
 
 
 def _build_rates(
     *,
     duty_rate: Optional[float],
+    effective_duty_rate: Optional[float],
     vat_rate: Optional[float],
     origin_rules,
 ) -> "RatesResult":
     from app.schemas.import_analysis import RatesResult
     return RatesResult(
         duty_rate=duty_rate,
+        effective_duty_rate=effective_duty_rate,
         vat_rate=vat_rate,
         preferential_duty_rate=origin_rules.preferential_duty_rate,
         preferential_eligible=origin_rules.preferential_eligible,

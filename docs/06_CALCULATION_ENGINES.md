@@ -1,588 +1,2856 @@
-# 06 — Calculation Engines
-
-## Engine Design Principles
-
-1. **Pure functions** — engines take typed inputs, return typed outputs, no side effects
-2. **No framework imports** — engines import only from Python stdlib and `decimal`
-3. **Audit-by-design** — every step logs a formula description that a customs officer could follow
-4. **Fail-explicit** — engines raise typed `EngineError` with structured reason, never silently return zero
-5. **Decimal arithmetic only** — never use `float` for monetary values
-6. **Composable** — engines can be called standalone or chained by the orchestrator
-
----
-
-## Base Types
-
-```python
-# All engines use these shared base types
-
-@dataclass
-class Money:
-    amount: Decimal
-    currency: str  # ISO 4217
-
-@dataclass
-class AuditStep:
-    step_name: str
-    formula_description: str
-    input_snapshot: dict
-    output_snapshot: dict
-
-@dataclass
-class EngineResult:
-    success: bool
-    output: dict
-    audit_steps: list[AuditStep]
-    warnings: list[str]
-
-class EngineError(Exception):
-    code: str
-    message: str
-    recoverable: bool
-```
-
----
-
-## Engine 1: Classification Engine
-
-**Plan:** Free (basic) + Pro (full)
-
-### Responsibility
-Validate and enrich HS code data for each shipment line.
-
-### Inputs
-- `hs_code: str` — 8–10 digit
-- `jurisdiction: str` — UK or EU
-- `description: str` — goods description
-- `quantity_unit: str`
-
-### Outputs
-- `validated_code: str` — canonical 10-digit code
-- `description: str` — official tariff description
-- `supplementary_unit: str | None` — required unit for this heading
-- `supplementary_unit_required: bool`
-- `misclassification_risk: str` — LOW | MEDIUM | HIGH (Pro only)
-- `alternative_codes: list[str]` — Pro only
-
-### Logic Steps
-1. **Normalize** — strip dots, spaces, pad to 10 digits with zeros
-2. **Validate** — lookup in `hs_codes` table; fail if not found (`INVALID_HS_CODE`)
-3. **Check validity dates** — warn if code expires within 30 days
-4. **Detect supplementary unit** — load from `hs_codes.supplementary_unit`
-5. **Validate unit match** — if supplementary unit required, check `quantity_unit` matches; warn if mismatch
-6. **Risk scoring (Pro)** — rule-based check: does description keyword match the HS heading?
-
-### Free vs Pro
-| Feature | Free | Pro |
-|---|---|---|
-| Code validation | ✅ | ✅ |
-| Supplementary unit detection | ✅ | ✅ |
-| Description match validation | ❌ | ✅ |
-| Misclassification risk score | ❌ | ✅ |
-| Alternative code suggestions | ❌ | ✅ |
-
----
-
-## Engine 2: Customs Valuation Engine
-
-**Plan:** PRO only
-
-### Responsibility
-Compute the correct Customs Value per the WTO Customs Valuation Agreement (Transaction Value method as primary).
-
-### Inputs
-- `invoice_value: Money`
-- `incoterm: str`
-- `freight_cost: Money`
-- `insurance_cost: Money`
-- `handling_cost: Money`
-- `packing_costs: Money`
-- `royalties: Money`
-- `assists: Money`
-- `buying_commission: Money`
-- `selling_commission: Money`
-- `is_related_party: bool`
-- `origin_country: str`
-- `destination_country: str`
-
-### Outputs
-- `customs_value: Money` — in destination currency (GBP for UK, EUR for EU)
-- `incoterm_adjustments: list[AdjustmentItem]` — itemized additions to reach CIF
-
-### Logic Steps
-
-#### Step 1: Incoterm Gap Analysis
-Different Incoterms result in different cost elements being included in the invoice. The engine must add missing elements to reach CIF (Cost + Insurance + Freight) border value.
-
-| Incoterm | Freight in invoice? | Insurance in invoice? | Adjustment needed |
-|---|---|---|---|
-| EXW | No | No | Add freight + insurance + handling |
-| FCA | No | No | Add freight + insurance |
-| FOB | No | No | Add freight + insurance |
-| CFR | Yes | No | Add insurance |
-| CIF | Yes | Yes | None — already correct |
-| DAP | Yes | Yes | Subtract inland portion (estimate) |
-| DDP | Yes | Yes | Subtract duty + inland |
-
-#### Step 2: Add Dutiable Additions
-```
-Customs Value = CIF Border Value
-              + packing_costs
-              + royalties (if related to the goods and condition of sale)
-              + assists (tools, molds, etc. supplied by buyer)
-              + selling_commission (NOT buying commission)
-```
-
-#### Step 3: Related Party Check
-- If `is_related_party = true`, flag for review
-- Apply test values check logic (simplified for MVP; flag to manual review)
-- Output `related_party_flag: true` and warning in audit
-
-#### Step 4: Currency Conversion
-- Convert invoice_value to destination currency using official customs FX rate
-- Source: HMRC monthly rate (UK) or ECB rate (EU)
-- Log: date of rate, rate applied, source
-
-### Free Tier Equivalent
-Free tier skips this engine and uses invoice value directly with market FX rate. This is disclosed to the user via a warning.
-
----
-
-## Engine 3: Tariff Measure Engine
-
-**Plan:** Free (ad valorem only) + Pro (all measure types)
-
-### Responsibility
-Look up applicable tariff measures for a given HS code and compute duty.
-
-### Inputs
-- `hs_code: str`
-- `jurisdiction: str`
-- `country_of_origin: str`
-- `customs_value: Money`
-- `quantity: Decimal`
-- `quantity_unit: str`
-- `gross_weight_kg: Decimal`
-- `calculation_date: date`
-- `preferential_agreement: str | None` — if origin engine confirmed preference
-- `quota_status: str | None` — IN_QUOTA | OUT_OF_QUOTA | NOT_APPLICABLE
-
-### Outputs
-- `applicable_measures: list[MeasureResult]`
-- `duty_amount: Money`
-- `measure_conditions: list[str]` — license/cert requirements
-
-### Measure Calculation Logic
-
-#### Ad Valorem (`AD_VALOREM`)
-```
-duty = customs_value × rate_ad_valorem
-```
-
-#### Specific (`SPECIFIC`)
-```
-duty = quantity_in_unit × rate_specific_amount
-# Example: 2,000 kg × £3.50/100kg = £70.00
-# Must normalize quantity to the rate unit (e.g., divide kg by 100)
-```
-
-#### Mixed/Compound (`MIXED`)
-```
-duty_ad_valorem = customs_value × rate_ad_valorem
-duty_specific = quantity_in_unit × rate_specific_amount
-duty = duty_ad_valorem + duty_specific
-# Apply minimum/maximum if set
-if rate_minimum: duty = max(duty, rate_minimum)
-if rate_maximum: duty = min(duty, rate_maximum)
-```
-
-#### Anti-Dumping / Countervailing (`ANTI_DUMPING`, `COUNTERVAILING`)
-```
-# These are ADDITIONAL to the standard import duty
-# Must check country_of_origin match on measure
-# Must check if specific exporter TARIC code is set (some are exporter-specific)
-additional_duty = customs_value × rate_ad_valorem
-total_duty = standard_duty + additional_duty
-```
-
-#### Safeguard (`SAFEGUARD`)
-```
-# Similar to anti-dumping but triggered by import volumes
-# Check if safeguard is currently active (valid_from/valid_to)
-# Apply additional duty on top of standard
-```
-
-#### Quota Logic
-```
-if quota_status == "IN_QUOTA":
-    use tariff_measures WHERE measure_type = 'QUOTA_IN'
-    (usually preferential or zero rate)
-elif quota_status == "OUT_OF_QUOTA":
-    use tariff_measures WHERE measure_type = 'QUOTA_OUT'
-    (usually the full MFN rate)
-else:
-    use standard measures (no quota)
-```
-
-#### Agricultural Components
-```
-total_duty = standard_duty + agricultural_component_per_100kg × (gross_weight_kg / 100)
-```
-
-### Suspension Logic
-If a measure has `suspension = true` and is within its validity period:
-- Apply zero duty for that measure
-- Log suspension active: code, valid dates
-
-### Free vs Pro Measures
-| Measure Type | Free | Pro |
-|---|---|---|
-| Ad Valorem (standard) | ✅ | ✅ |
-| Specific duties | ❌ | ✅ |
-| Mixed/compound | ❌ | ✅ |
-| Anti-dumping | ❌ | ✅ |
-| Countervailing | ❌ | ✅ |
-| Safeguard | ❌ | ✅ |
-| Quota logic | ❌ | ✅ |
-| Agricultural component | ❌ | ✅ |
-| Suspension detection | ❌ | ✅ |
-
----
-
-## Engine 4: Rules of Origin Engine
-
-**Plan:** PRO only
-
-### Responsibility
-Determine whether goods qualify for preferential duty treatment under a trade agreement.
-
-### Inputs
-- `hs_code: str`
-- `country_of_origin: str`
-- `destination_country: str`
-- `has_proof_of_origin: bool`
-- `invoice_value: Money`
-- `is_related_party: bool`
-
-### Outputs
-- `preference_available: bool`
-- `preference_applicable: bool` — preference_available AND proof_of_origin AND rule_met
-- `applicable_agreement: str | None`
-- `product_specific_rule: str | None` — the PSR text
-- `rule_type: str | None` — CTH | CTSH | RVC | WHOLLY_OBTAINED
-- `proof_required: str` — 'REX', 'EUR.1', 'ORIGIN_DECLARATION', 'NONE'
-- `mfn_fallback: bool` — true if falling back to MFN rate
-
-### Logic Steps
-
-1. **Agreement detection** — lookup active trade agreements for origin↔destination pair
-   - Priority: UK-EU TCA, UK-Japan CEPA, UK-AUS FTA, UK-NZ FTA, GSP, etc.
-   - Some HS codes may have multiple applicable agreements (pick most favorable)
-
-2. **Product-specific rule retrieval** — query `origin_rules` for the HS code range
-
-3. **Rule validation** — simplified rule checking:
-   - **CTH (Change of Tariff Heading)**: verify HS heading (4-digit) of output ≠ inputs. Cannot auto-verify without full BoM; flag for manual confirmation
-   - **CTSH (Change of Tariff Sub-Heading)**: similar to CTH at 6-digit level
-   - **RVC (Regional Value Content)**: `(invoice_value - non_originating_inputs) / invoice_value ≥ threshold`
-   - **WHOLLY_OBTAINED**: no computation, just confirm country claim
-
-4. **Proof of origin check** — if `has_proof_of_origin = false`, preference cannot be applied; flag warning
-
-5. **Decision**:
-   - If preference_available AND rule_met AND has_proof_of_origin → `preference_applicable = true`
-   - Otherwise → `mfn_fallback = true`
-
-6. **Return preferred rate to TariffMeasureEngine** — pass `preferential_agreement` so engine selects in-preference measure
-
----
-
-## Engine 5: VAT Engine
-
-**Plan:** Free (standard rate only) + Pro (all)
-
-### Responsibility
-Calculate import VAT correctly using the customs VAT base.
-
-### Inputs
-- `customs_value: Money`
-- `duty_amount: Money`
-- `jurisdiction: str`
-- `vat_registration_status: str` — REGISTERED | NOT_REGISTERED
-- `postponed_accounting_requested: bool` — Pro only
-- `goods_category: str` — STANDARD | REDUCED | ZERO | EXEMPT
-
-### Outputs
-- `vat_base: Money`
-- `vat_rate: Decimal`
-- `vat_amount: Money`
-- `is_postponed: bool`
-- `deductible: bool`
-
-### Logic
-
-#### VAT Base Calculation
-```
-VAT Base = customs_value
-         + import_duty
-         + excise_duty (if applicable)
-         + any border charges included in customs value computation
-
-# UK: VAT base = CIF customs value + duty + excise
-# EU: Same logic, per each member state's implementation
-```
-
-#### Standard Rate Application
-```
-vat_amount = vat_base × vat_rate
-# UK standard: 20%
-# EU: varies by member state (17%–27%)
-```
-
-#### Postponed VAT Accounting (Pro)
-- UK: available to VAT-registered importers via PIVA
-- `is_postponed = true` → vat_amount is accounted, not physically paid at border
-- Flag `deductible = true` for VAT-registered businesses
-
-#### Reduced / Zero / Exempt (Pro)
-- Lookup goods_category against HS code VAT schedule
-- Apply correct rate (0%, 5%, or 20% for UK)
-
-### Free Tier
-- Standard rate only (20% UK, user-specified EU)
-- No postponed accounting
-- Assumes standard goods category
-
----
-
-## Engine 6: Excise Engine
-
-**Plan:** PRO only
-
-### Responsibility
-Calculate excise duties for regulated product categories.
-
-### Inputs
-- `hs_code: str`
-- `goods_category: str` — ALCOHOL | TOBACCO | ENERGY | PLASTIC_PACKAGING | OTHER
-- `quantity: Decimal`
-- `quantity_unit: str`
-- `abv: Decimal | None` — alcohol by volume (%)
-- `tobacco_type: str | None`
-- `destination_country: str`
-
-### Outputs
-- `excise_amount: Money`
-- `excise_type: str`
-- `rate_applied: str`
-
-### Logic by Category
-
-#### Alcohol
-```
-UK Beer: duty = abv × volume_liters × rate_per_abv_per_liter
-UK Wine (still, 11.5-14.5%): flat rate per liter
-UK Spirits: rate per liter of pure alcohol
-```
-Rates sourced from HMRC excise notice tables, updated via data feed.
-
-#### Tobacco
-```
-Cigarettes: specific duty per 1,000 cigarettes + ad valorem % of retail price
-Cigars: duty per kg
-Hand-rolling tobacco: duty per kg
-```
-
-#### Energy Products (CBAM / Carbon Border Adjustment)
-- CBAM applies to: steel, cement, aluminium, fertilisers, electricity, hydrogen
-- Calculate embedded carbon tonnes × CBAM rate
-- Requires carbon content data from user or default factor
-
-#### Plastic Packaging Tax (UK)
-```
-if recycled_plastic_content < 30%:
-    tax = weight_kg × £200/tonne
-```
-
----
-
-## Engine 7: FX Engine
-
-**Plan:** Free (market rate) + Pro (official customs rate)
-
-### Responsibility
-Convert monetary values between currencies using the correct exchange rate.
-
-### Inputs
-- `amount: Money`
-- `target_currency: str`
-- `calculation_date: date`
-- `rate_type: str` — OFFICIAL_HMRC | OFFICIAL_ECB | MARKET
-
-### Outputs
-- `converted_amount: Money`
-- `rate_applied: Decimal`
-- `rate_date: date`
-- `rate_source: str`
-
-### Logic
-- **HMRC Rate** (UK customs): Published monthly by HMRC. Use rate for the month of importation. Source: HMRC online exchange rates table.
-- **ECB Rate** (EU customs): Daily reference rate from ECB. Use rate for the date of acceptance of customs declaration.
-- **Market Rate** (free tier): Real-time rate from open API (e.g., exchangerate.host or ECB daily). Not accepted by customs authorities but used for indicative calculations.
-
-### Rate Lookup Logic
-```
-1. Check Redis cache: fx:{base}:{quote}:{type}:{date}
-2. If cache miss → query fx_rates table
-3. If not found in table for exact date → use nearest prior date (look back up to 7 days)
-4. If still not found → raise DataUnavailableError
-5. Cache result for 1 hour (official rates don't change mid-day)
-```
-
----
-
-## Engine 8: Clearance & Logistics Engine
-
-**Plan:** PRO only (basic estimate for Free)
-
-### Responsibility
-Estimate customs clearance and logistics costs.
-
-### Inputs
-- `goods_value: Money`
-- `number_of_hs_lines: int`
-- `port_of_entry: str`
-- `transport_mode: str` — AIR | SEA | ROAD | RAIL
-- `include_risk_modeling: bool`
-
-### Outputs
-- `broker_fee: Money`
-- `declaration_fee: Money`
-- `port_handling_fee: Money`
-- `inspection_risk_fee: Money` — probability-weighted cost
-- `inland_transport_estimate: Money`
-- `total_clearance_estimate: Money`
-
-### Logic
-All fees are estimates based on standard market rates. These are:
-- **Broker fee**: tiered by goods value and line count (configurable rate table)
-- **Declaration fee**: flat fee per declaration + fee per additional line
-- **Port handling**: variable by port and transport mode
-- **Inspection risk**: `P(inspection) × avg_inspection_cost`
-  - P(inspection) varies by HS code risk profile, country of origin, transport mode
-- **Inland transport**: simple distance-based estimate using port → destination postcode
-
----
-
-## Engine 9: Line-Level Aggregator
-
-**Plan:** PRO only (Free restricted to 1 line)
-
-### Responsibility
-Run all engines per line, then aggregate to shipment totals.
-
-### Inputs
-- `lines: list[ShipmentLine]`
-- `shipment: Shipment`
-- `engine_results_per_line: list[LineEngineResults]`
-
-### Outputs
-- `line_results: list[LineResult]`
-- `totals: AggregatedTotals`
-
-### Logic
-1. Allocate freight/insurance to lines pro-rata by weight or value (configurable)
-2. Run all applicable engines per line independently
-3. Each line gets its own:
-   - Customs value (after freight allocation)
-   - Duty (potentially different rates per HS code)
-   - VAT base
-   - Origin status
-   - Compliance flags
-4. Aggregate across lines:
-   - Sum all duty amounts
-   - Sum all VAT amounts
-   - Sum all excise amounts
-   - Sum clearance (at shipment level, not per line)
-   - Compute total landed cost
-
-### Freight Allocation Methods
-- **By weight**: `line_freight = total_freight × (line_weight / total_weight)`
-- **By value**: `line_freight = total_freight × (line_value / total_value)`
-- **Equal split**: `line_freight = total_freight / n_lines`
-- Default: by weight. Configurable per request.
-
----
-
-## Engine 10: Compliance Flag Engine
-
-**Plan:** PRO only
-
-### Responsibility
-Check all HS codes and countries against compliance requirements and generate structured warnings.
-
-### Inputs
-- `hs_codes: list[str]`
-- `country_of_origin: str`
-- `destination_country: str`
-- `jurisdiction: str`
-
-### Outputs
-- `flags: list[ComplianceFlag]`
-- `confidence_score_penalty: Decimal` — reduces overall confidence if compliance data is incomplete
-
-### Checks
-1. **Restricted goods** — query `restricted_goods` table, match by code prefix
-2. **License requirements** — from `tariff_measures.measure_condition`
-3. **Certificate requirements** — phytosanitary, veterinary, CE marking, etc.
-4. **Sanctions check** — query `sanctions` table for country + HS code scope
-5. **CITES** — Convention on International Trade in Endangered Species flag
-6. **Dual-use goods** — export control classification flag
-
-### Flag Severity
-- `INFO` — informational, no action required at calculation time
-- `WARNING` — action likely required before import (user must obtain license/cert)
-- `BLOCK` — goods cannot be imported under current conditions; calculation marked as advisory only
-
----
-
-## Engine Orchestrator
-
-**File:** `app/application/calculations/orchestrator.py`
-
-### Orchestration Order
-```
-1. ClassificationEngine (per line) — must succeed before others
-2. FXEngine — currency conversion needed by others
-3. CustomsValuationEngine (per line) — customs value needed by duty engines
-4. RulesOfOriginEngine (per line) — determines preference for TariffMeasureEngine
-5. TariffMeasureEngine (per line) — duty calculation
-6. ExciseEngine (per line, if applicable)
-7. VATEngine (per line) — needs customs value + duty
-8. ClearanceEngine (at shipment level)
-9. ComplianceFlagEngine (per line)
-10. LineLevelAggregator — combine all line results
-```
-
-### Error Handling Strategy
-- If ClassificationEngine fails on any line → abort entire calculation (cannot proceed)
-- If CustomsValuationEngine fails → abort (all downstream depends on it)
-- If RulesOfOriginEngine fails → fall back to MFN rate, log warning, continue
-- If ExciseEngine fails → log warning, set excise = 0 with flag, continue
-- If ComplianceFlagEngine fails → log warning, mark compliance flags as unavailable, continue
-- All failures reduce the confidence score
-
-### Confidence Score Formula
-```
-base_score = 1.0
-penalties:
-  - origin engine fallback to MFN: -0.05
-  - compliance engine unavailable: -0.05
-  - related party transaction: -0.03
-  - proof of origin missing: -0.04
-  - supplementary unit mismatch: -0.08
-  - data older than 30 days: -0.10
-  - any BLOCK flag active: -0.30
-
-confidence_score = max(0.0, base_score + sum(penalties))
-```
+{
+  "data": {
+    "hs_code": "7208510000",
+    "description": "HS 7208510000",
+    "origin_country": "GB",
+    "origin_input": "GB",
+    "destination_country": "DE",
+    "destination_market": "EU",
+    "origin": {
+      "origin_code": "GB",
+      "origin_name": "GB",
+      "origin_code_type": "country",
+      "iso2": "GB",
+      "iso3": null,
+      "is_erga_omnes": false,
+      "is_group": false,
+      "group_category": null,
+      "exists": true,
+      "member_countries": [
+        "GB"
+      ]
+    },
+    "origin_resolution": [
+      {
+        "origin_code": "GB",
+        "exists": true,
+        "origin_name": "GB",
+        "origin_code_type": "country",
+        "is_group": false,
+        "is_erga_omnes": false,
+        "group_category": null
+      },
+      {
+        "origin_code": "1008",
+        "exists": true,
+        "origin_name": "All third countries",
+        "origin_code_type": "group_numeric",
+        "is_group": true,
+        "is_erga_omnes": false,
+        "group_category": "other"
+      },
+      {
+        "origin_code": "1011",
+        "exists": true,
+        "origin_name": "ERGA OMNES",
+        "origin_code_type": "erga_omnes",
+        "is_group": false,
+        "is_erga_omnes": true,
+        "group_category": "erga_omnes"
+      }
+    ],
+    "rates_by_origin": [
+      {
+        "origin_code": "GB",
+        "origin_name": "GB",
+        "origin_code_type": "country",
+        "rate_basis": "bilateral_preference",
+        "rate_type": "PREFERENTIAL",
+        "duty_rate": 0,
+        "duty_amount": null,
+        "duty_unit": null,
+        "valid_from": "2021-01-01",
+        "valid_to": null,
+        "source": "TARIC",
+        "duty_expression": "0.000 %",
+        "human_readable": "0%",
+        "conditions": []
+      },
+      {
+        "origin_code": "1008",
+        "origin_name": "All third countries",
+        "origin_code_type": "group_numeric",
+        "rate_basis": "import_control",
+        "rate_type": "IMPORT_CONTROL",
+        "duty_rate": null,
+        "duty_amount": null,
+        "duty_unit": null,
+        "valid_from": "2023-12-19",
+        "valid_to": "2026-12-31",
+        "source": "TARIC",
+        "duty_expression": "Cond:  Y cert: L-139 (29):; Y cert: Y-824 (29):; Y cert: Y-878 (29):; Y cert: Y-859 (29):; Y cert: L-143 (29):; Y (09):",
+        "human_readable": "See conditions",
+        "conditions": [
+          {
+            "condition_type": "Y",
+            "condition_logic": "ANY_SUFFICIENT",
+            "certificate_code": "L-139",
+            "certificate_description": "Unknown — code L-139",
+            "duty_expression_code": "29",
+            "duty_rate_if_met": null,
+            "duty_rate_if_not_met": null,
+            "note": "This measure does NOT apply if any one of the listed certificates is presented."
+          },
+          {
+            "condition_type": "Y",
+            "condition_logic": "ANY_SUFFICIENT",
+            "certificate_code": "Y-824",
+            "certificate_description": "Unknown — code Y-824",
+            "duty_expression_code": "29",
+            "duty_rate_if_met": null,
+            "duty_rate_if_not_met": null,
+            "note": "This measure does NOT apply if any one of the listed certificates is presented."
+          },
+          {
+            "condition_type": "Y",
+            "condition_logic": "ANY_SUFFICIENT",
+            "certificate_code": "Y-878",
+            "certificate_description": "Unknown — code Y-878",
+            "duty_expression_code": "29",
+            "duty_rate_if_met": null,
+            "duty_rate_if_not_met": null,
+            "note": "This measure does NOT apply if any one of the listed certificates is presented."
+          },
+          {
+            "condition_type": "Y",
+            "condition_logic": "ANY_SUFFICIENT",
+            "certificate_code": "Y-859",
+            "certificate_description": "Unknown — code Y-859",
+            "duty_expression_code": "29",
+            "duty_rate_if_met": null,
+            "duty_rate_if_not_met": null,
+            "note": "This measure does NOT apply if any one of the listed certificates is presented."
+          },
+          {
+            "condition_type": "Y",
+            "condition_logic": "ANY_SUFFICIENT",
+            "certificate_code": "L-143",
+            "certificate_description": "Unknown — code L-143",
+            "duty_expression_code": "29",
+            "duty_rate_if_met": null,
+            "duty_rate_if_not_met": null,
+            "note": "This measure does NOT apply if any one of the listed certificates is presented."
+          },
+          {
+            "condition_type": "Y",
+            "condition_logic": "ANY_SUFFICIENT",
+            "certificate_code": null,
+            "certificate_description": null,
+            "duty_expression_code": "09",
+            "duty_rate_if_met": null,
+            "duty_rate_if_not_met": null,
+            "note": "This measure does NOT apply if any one of the listed certificates is presented."
+          }
+        ]
+      },
+      {
+        "origin_code": "1011",
+        "origin_name": "ERGA OMNES",
+        "origin_code_type": "erga_omnes",
+        "rate_basis": "MFN",
+        "rate_type": "MFN",
+        "duty_rate": 0,
+        "duty_amount": null,
+        "duty_unit": null,
+        "valid_from": "2005-01-01",
+        "valid_to": null,
+        "source": "TARIC",
+        "duty_expression": "0.000 %",
+        "human_readable": "0%",
+        "conditions": []
+      }
+    ],
+    "best_rate": {
+      "origin_code": "GB",
+      "rate_basis": "bilateral_preference",
+      "duty_rate": 0,
+      "saving_vs_mfn": 0,
+      "saving_pct": null
+    },
+    "available_origin_codes": [
+      "1008",
+      "1011",
+      "1033",
+      "1034",
+      "1035",
+      "2000",
+      "2005",
+      "5005",
+      "CI",
+      "CM",
+      "EG",
+      "FJ",
+      "GB",
+      "GH",
+      "ID",
+      "IL",
+      "IN",
+      "JO",
+      "KE",
+      "KP",
+      "KR",
+      "LB",
+      "MA",
+      "PG",
+      "PS",
+      "RU",
+      "SB",
+      "TN",
+      "TR",
+      "UA",
+      "WS",
+      "XC",
+      "XL"
+    ],
+    "origin_matrix": [
+      {
+        "origin_code": "1008",
+        "origin_name": "All third countries",
+        "origin_code_type": "group_numeric",
+        "measure_types": [
+          "IMPORT_CONTROL"
+        ],
+        "records": [
+          {
+            "hs_code": "7208510000",
+            "market": "EU",
+            "origin_code": "1008",
+            "origin_name": "All third countries",
+            "origin_code_type": "group_numeric",
+            "measure_type": "IMPORT_CONTROL",
+            "rate_basis": "import_control",
+            "duty_rate": null,
+            "duty_amount": null,
+            "rate_specific_unit": null,
+            "valid_from": "2023-12-19",
+            "valid_to": "2026-12-31",
+            "source": "TARIC",
+            "ingested_at": "2026-03-29T02:19:46.912261+00:00",
+            "details": {
+              "measure_type_text": "Import control",
+              "measure_type_code": "763",
+              "origin_text": "All third countries",
+              "origin_code_raw": "1008",
+              "legal_base": "Regulation 0833/14",
+              "regulation": null,
+              "additional_code": null,
+              "order_no": null,
+              "duty_text": "Cond:  Y cert: L-139 (29):; Y cert: Y-824 (29):; Y cert: Y-878 (29):; Y cert: Y-859 (29):; Y cert: L-143 (29):; Y (09):"
+            }
+          }
+        ]
+      },
+      {
+        "origin_code": "1011",
+        "origin_name": "ERGA OMNES",
+        "origin_code_type": "erga_omnes",
+        "measure_types": [
+          "MFN",
+          "SUSPENSION"
+        ],
+        "records": [
+          {
+            "hs_code": "7208000000",
+            "market": "EU",
+            "origin_code": "1011",
+            "origin_name": "ERGA OMNES",
+            "origin_code_type": "erga_omnes",
+            "measure_type": "SUSPENSION",
+            "rate_basis": "MFN",
+            "duty_rate": 0,
+            "duty_amount": null,
+            "rate_specific_unit": null,
+            "valid_from": "2016-07-01",
+            "valid_to": null,
+            "source": "TARIC",
+            "ingested_at": "2026-03-29T02:19:43.668137+00:00",
+            "details": {
+              "measure_type_text": "Suspension - goods for certain categories of ships, boats and other vessels and for drilling or production platforms",
+              "measure_type_code": "117",
+              "origin_text": "ERGA OMNES",
+              "origin_code_raw": "1011",
+              "legal_base": "Regulation 2658/87",
+              "regulation": null,
+              "additional_code": null,
+              "order_no": null,
+              "duty_text": "0.000 %"
+            }
+          },
+          {
+            "hs_code": "7208000000",
+            "market": "EU",
+            "origin_code": "1011",
+            "origin_name": "ERGA OMNES",
+            "origin_code_type": "erga_omnes",
+            "measure_type": "MFN",
+            "rate_basis": "MFN",
+            "duty_rate": 0,
+            "duty_amount": null,
+            "rate_specific_unit": null,
+            "valid_from": "2005-01-01",
+            "valid_to": null,
+            "source": "TARIC",
+            "ingested_at": "2026-03-29T02:19:43.664808+00:00",
+            "details": {
+              "measure_type_text": "Third country duty",
+              "measure_type_code": "103",
+              "origin_text": "ERGA OMNES",
+              "origin_code_raw": "1011",
+              "legal_base": "Regulation 1789/03",
+              "regulation": null,
+              "additional_code": null,
+              "order_no": null,
+              "duty_text": "0.000 %"
+            }
+          }
+        ]
+      },
+      {
+        "origin_code": "1033",
+        "origin_name": "1033",
+        "origin_code_type": "group_numeric",
+        "measure_types": [
+          "PREFERENTIAL"
+        ],
+        "records": [
+          {
+            "hs_code": "7200000000",
+            "market": "EU",
+            "origin_code": "1033",
+            "origin_name": "1033",
+            "origin_code_type": "group_numeric",
+            "measure_type": "PREFERENTIAL",
+            "rate_basis": "group_preference",
+            "duty_rate": 0,
+            "duty_amount": null,
+            "rate_specific_unit": null,
+            "valid_from": "2008-12-29",
+            "valid_to": null,
+            "source": "TARIC",
+            "ingested_at": "2026-03-29T02:19:41.799604+00:00",
+            "details": {
+              "measure_type_text": "Tariff preference",
+              "measure_type_code": "142",
+              "origin_text": "CARIFORUM",
+              "origin_code_raw": "1033",
+              "legal_base": "Decision 0805/08",
+              "regulation": null,
+              "additional_code": null,
+              "order_no": null,
+              "duty_text": "0.000 %"
+            }
+          }
+        ]
+      },
+      {
+        "origin_code": "1034",
+        "origin_name": "1034",
+        "origin_code_type": "group_numeric",
+        "measure_types": [
+          "PREFERENTIAL"
+        ],
+        "records": [
+          {
+            "hs_code": "7200000000",
+            "market": "EU",
+            "origin_code": "1034",
+            "origin_name": "1034",
+            "origin_code_type": "group_numeric",
+            "measure_type": "PREFERENTIAL",
+            "rate_basis": "group_preference",
+            "duty_rate": 0,
+            "duty_amount": null,
+            "rate_specific_unit": null,
+            "valid_from": "2012-05-14",
+            "valid_to": null,
+            "source": "TARIC",
+            "ingested_at": "2026-03-29T02:19:41.780391+00:00",
+            "details": {
+              "measure_type_text": "Tariff preference",
+              "measure_type_code": "142",
+              "origin_text": "Eastern and Southern Africa States",
+              "origin_code_raw": "1034",
+              "legal_base": "Decision 0196/12",
+              "regulation": null,
+              "additional_code": null,
+              "order_no": null,
+              "duty_text": "0.000 %"
+            }
+          }
+        ]
+      },
+      {
+        "origin_code": "1035",
+        "origin_name": "1035",
+        "origin_code_type": "group_numeric",
+        "measure_types": [
+          "PREFERENTIAL"
+        ],
+        "records": [
+          {
+            "hs_code": "7200000000",
+            "market": "EU",
+            "origin_code": "1035",
+            "origin_name": "1035",
+            "origin_code_type": "group_numeric",
+            "measure_type": "PREFERENTIAL",
+            "rate_basis": "group_preference",
+            "duty_rate": 0,
+            "duty_amount": null,
+            "rate_specific_unit": null,
+            "valid_from": "2016-10-10",
+            "valid_to": null,
+            "source": "TARIC",
+            "ingested_at": "2026-03-29T02:19:41.776204+00:00",
+            "details": {
+              "measure_type_text": "Tariff preference",
+              "measure_type_code": "142",
+              "origin_text": "SADC EPA",
+              "origin_code_raw": "1035",
+              "legal_base": "Decision 1623/16",
+              "regulation": null,
+              "additional_code": null,
+              "order_no": null,
+              "duty_text": "0.000 %"
+            }
+          }
+        ]
+      },
+      {
+        "origin_code": "2000",
+        "origin_name": "2000",
+        "origin_code_type": "group_numeric",
+        "measure_types": [
+          "PREFERENTIAL"
+        ],
+        "records": [
+          {
+            "hs_code": "7200000000",
+            "market": "EU",
+            "origin_code": "2000",
+            "origin_name": "2000",
+            "origin_code_type": "group_numeric",
+            "measure_type": "PREFERENTIAL",
+            "rate_basis": "group_preference",
+            "duty_rate": 0,
+            "duty_amount": null,
+            "rate_specific_unit": null,
+            "valid_from": "2025-10-03",
+            "valid_to": null,
+            "source": "TARIC",
+            "ingested_at": "2026-03-29T02:19:41.759381+00:00",
+            "details": {
+              "measure_type_text": "Tariff preference",
+              "measure_type_code": "142",
+              "origin_text": "Preferential origin in accordance with the Agreement in the form of an Exchange of Letters between the European Union and the Kingdom of Morocco on the amendment of Protocols 1 and 4 to the Euro-Mediterranean Agreement establishing an association between the European Communities and their Member States, of the one part, and the Kingdom of Morocco, of the other part.",
+              "origin_code_raw": "2000",
+              "legal_base": "Decision 2022/25",
+              "regulation": null,
+              "additional_code": null,
+              "order_no": null,
+              "duty_text": "0.000 %"
+            }
+          }
+        ]
+      },
+      {
+        "origin_code": "2005",
+        "origin_name": "2005",
+        "origin_code_type": "group_numeric",
+        "measure_types": [
+          "PREFERENTIAL"
+        ],
+        "records": [
+          {
+            "hs_code": "7200000000",
+            "market": "EU",
+            "origin_code": "2005",
+            "origin_name": "2005",
+            "origin_code_type": "group_numeric",
+            "measure_type": "PREFERENTIAL",
+            "rate_basis": "group_preference",
+            "duty_rate": 0,
+            "duty_amount": null,
+            "rate_specific_unit": null,
+            "valid_from": "2014-01-01",
+            "valid_to": null,
+            "source": "TARIC",
+            "ingested_at": "2026-03-29T02:19:41.715058+00:00",
+            "details": {
+              "measure_type_text": "Tariff preference",
+              "measure_type_code": "142",
+              "origin_text": "GSP-EBA (Special arrangement for the least-developed countries - Everything But Arms)",
+              "origin_code_raw": "2005",
+              "legal_base": "Regulation 0978/12",
+              "regulation": null,
+              "additional_code": null,
+              "order_no": null,
+              "duty_text": "0.000 %"
+            }
+          }
+        ]
+      },
+      {
+        "origin_code": "5005",
+        "origin_name": "5005",
+        "origin_code_type": "safeguard",
+        "measure_types": [
+          "SAFEGUARD",
+          "TARIFF_QUOTA"
+        ],
+        "records": [
+          {
+            "hs_code": "7208510000",
+            "market": "EU",
+            "origin_code": "5005",
+            "origin_name": "5005",
+            "origin_code_type": "safeguard",
+            "measure_type": "TARIFF_QUOTA",
+            "rate_basis": "tariff_quota",
+            "duty_rate": 0,
+            "duty_amount": null,
+            "rate_specific_unit": null,
+            "valid_from": "2025-07-08",
+            "valid_to": "2026-03-31",
+            "source": "TARIC",
+            "ingested_at": "2026-03-29T02:19:46.889824+00:00",
+            "details": {
+              "measure_type_text": "Non preferential tariff quota",
+              "measure_type_code": "122",
+              "origin_text": "Countries subject to safeguard measures",
+              "origin_code_raw": "5005",
+              "legal_base": "Regulation 0159/19",
+              "regulation": null,
+              "additional_code": null,
+              "order_no": "098617",
+              "duty_text": "0.000 %"
+            }
+          },
+          {
+            "hs_code": "7208510000",
+            "market": "EU",
+            "origin_code": "5005",
+            "origin_name": "5005",
+            "origin_code_type": "safeguard",
+            "measure_type": "SAFEGUARD",
+            "rate_basis": "safeguard",
+            "duty_rate": 25,
+            "duty_amount": null,
+            "rate_specific_unit": null,
+            "valid_from": "2025-04-01",
+            "valid_to": "2026-06-30",
+            "source": "TARIC",
+            "ingested_at": "2026-03-29T02:19:46.897504+00:00",
+            "details": {
+              "measure_type_text": "Additional duties (safeguard)",
+              "measure_type_code": "696",
+              "origin_text": "Countries subject to safeguard measures",
+              "origin_code_raw": "5005",
+              "legal_base": "Regulation 0159/19",
+              "regulation": null,
+              "additional_code": null,
+              "order_no": null,
+              "duty_text": "25.000 %"
+            }
+          }
+        ]
+      },
+      {
+        "origin_code": "CI",
+        "origin_name": "CI",
+        "origin_code_type": "country",
+        "measure_types": [
+          "PREFERENTIAL"
+        ],
+        "records": [
+          {
+            "hs_code": "7200000000",
+            "market": "EU",
+            "origin_code": "CI",
+            "origin_name": "CI",
+            "origin_code_type": "country",
+            "measure_type": "PREFERENTIAL",
+            "rate_basis": "bilateral_preference",
+            "duty_rate": 0,
+            "duty_amount": null,
+            "rate_specific_unit": null,
+            "valid_from": "2019-12-02",
+            "valid_to": null,
+            "source": "TARIC",
+            "ingested_at": "2026-03-29T02:19:41.755777+00:00",
+            "details": {
+              "measure_type_text": "Tariff preference",
+              "measure_type_code": "142",
+              "origin_text": "Ivory Coast",
+              "origin_code_raw": "CI",
+              "legal_base": "Decision 0156/09",
+              "regulation": null,
+              "additional_code": null,
+              "order_no": null,
+              "duty_text": "0.000 %"
+            }
+          }
+        ]
+      },
+      {
+        "origin_code": "CM",
+        "origin_name": "CM",
+        "origin_code_type": "country",
+        "measure_types": [
+          "PREFERENTIAL"
+        ],
+        "records": [
+          {
+            "hs_code": "7200000000",
+            "market": "EU",
+            "origin_code": "CM",
+            "origin_name": "CM",
+            "origin_code_type": "country",
+            "measure_type": "PREFERENTIAL",
+            "rate_basis": "bilateral_preference",
+            "duty_rate": 0,
+            "duty_amount": null,
+            "rate_specific_unit": null,
+            "valid_from": "2014-08-04",
+            "valid_to": null,
+            "source": "TARIC",
+            "ingested_at": "2026-03-29T02:19:41.762201+00:00",
+            "details": {
+              "measure_type_text": "Tariff preference",
+              "measure_type_code": "142",
+              "origin_text": "Cameroon",
+              "origin_code_raw": "CM",
+              "legal_base": "Decision 0152/09",
+              "regulation": null,
+              "additional_code": null,
+              "order_no": null,
+              "duty_text": "0.000 %"
+            }
+          }
+        ]
+      },
+      {
+        "origin_code": "EG",
+        "origin_name": "EG",
+        "origin_code_type": "country",
+        "measure_types": [
+          "PREFERENTIAL"
+        ],
+        "records": [
+          {
+            "hs_code": "7200000000",
+            "market": "EU",
+            "origin_code": "EG",
+            "origin_name": "EG",
+            "origin_code_type": "country",
+            "measure_type": "PREFERENTIAL",
+            "rate_basis": "bilateral_preference",
+            "duty_rate": 0,
+            "duty_amount": null,
+            "rate_specific_unit": null,
+            "valid_from": "2004-06-01",
+            "valid_to": null,
+            "source": "TARIC",
+            "ingested_at": "2026-03-29T02:19:41.747214+00:00",
+            "details": {
+              "measure_type_text": "Tariff preference",
+              "measure_type_code": "142",
+              "origin_text": "Egypt",
+              "origin_code_raw": "EG",
+              "legal_base": "Decision 0635/04",
+              "regulation": null,
+              "additional_code": null,
+              "order_no": null,
+              "duty_text": "0.000 %"
+            }
+          }
+        ]
+      },
+      {
+        "origin_code": "FJ",
+        "origin_name": "FJ",
+        "origin_code_type": "country",
+        "measure_types": [
+          "PREFERENTIAL"
+        ],
+        "records": [
+          {
+            "hs_code": "7200000000",
+            "market": "EU",
+            "origin_code": "FJ",
+            "origin_name": "FJ",
+            "origin_code_type": "country",
+            "measure_type": "PREFERENTIAL",
+            "rate_basis": "bilateral_preference",
+            "duty_rate": 0,
+            "duty_amount": null,
+            "rate_specific_unit": null,
+            "valid_from": "2014-07-28",
+            "valid_to": null,
+            "source": "TARIC",
+            "ingested_at": "2026-03-29T02:19:41.795223+00:00",
+            "details": {
+              "measure_type_text": "Tariff preference",
+              "measure_type_code": "142",
+              "origin_text": "Fiji",
+              "origin_code_raw": "FJ",
+              "legal_base": "Decision 0729/09",
+              "regulation": null,
+              "additional_code": null,
+              "order_no": null,
+              "duty_text": "0.000 %"
+            }
+          }
+        ]
+      },
+      {
+        "origin_code": "GB",
+        "origin_name": "GB",
+        "origin_code_type": "country",
+        "measure_types": [
+          "PREFERENTIAL"
+        ],
+        "records": [
+          {
+            "hs_code": "7200000000",
+            "market": "EU",
+            "origin_code": "GB",
+            "origin_name": "GB",
+            "origin_code_type": "country",
+            "measure_type": "PREFERENTIAL",
+            "rate_basis": "bilateral_preference",
+            "duty_rate": 0,
+            "duty_amount": null,
+            "rate_specific_unit": null,
+            "valid_from": "2021-01-01",
+            "valid_to": null,
+            "source": "TARIC",
+            "ingested_at": "2026-03-29T02:19:41.718056+00:00",
+            "details": {
+              "measure_type_text": "Tariff preference",
+              "measure_type_code": "142",
+              "origin_text": "United Kingdom",
+              "origin_code_raw": "GB",
+              "legal_base": "Decision 2253/20",
+              "regulation": null,
+              "additional_code": null,
+              "order_no": null,
+              "duty_text": "0.000 %"
+            }
+          }
+        ]
+      },
+      {
+        "origin_code": "GH",
+        "origin_name": "GH",
+        "origin_code_type": "country",
+        "measure_types": [
+          "PREFERENTIAL"
+        ],
+        "records": [
+          {
+            "hs_code": "7200000000",
+            "market": "EU",
+            "origin_code": "GH",
+            "origin_name": "GH",
+            "origin_code_type": "country",
+            "measure_type": "PREFERENTIAL",
+            "rate_basis": "bilateral_preference",
+            "duty_rate": 0,
+            "duty_amount": null,
+            "rate_specific_unit": null,
+            "valid_from": "2016-12-15",
+            "valid_to": null,
+            "source": "TARIC",
+            "ingested_at": "2026-03-29T02:19:41.783366+00:00",
+            "details": {
+              "measure_type_text": "Tariff preference",
+              "measure_type_code": "142",
+              "origin_text": "Ghana",
+              "origin_code_raw": "GH",
+              "legal_base": "Decision 1850/16",
+              "regulation": null,
+              "additional_code": null,
+              "order_no": null,
+              "duty_text": "0.000 %"
+            }
+          }
+        ]
+      },
+      {
+        "origin_code": "ID",
+        "origin_name": "ID",
+        "origin_code_type": "country",
+        "measure_types": [
+          "TARIFF_QUOTA"
+        ],
+        "records": [
+          {
+            "hs_code": "7208510000",
+            "market": "EU",
+            "origin_code": "ID",
+            "origin_name": "ID",
+            "origin_code_type": "country",
+            "measure_type": "TARIFF_QUOTA",
+            "rate_basis": "tariff_quota",
+            "duty_rate": 0,
+            "duty_amount": null,
+            "rate_specific_unit": null,
+            "valid_from": "2025-04-01",
+            "valid_to": "2026-06-30",
+            "source": "TARIC",
+            "ingested_at": "2026-03-29T02:19:46.881990+00:00",
+            "details": {
+              "measure_type_text": "Non preferential tariff quota",
+              "measure_type_code": "122",
+              "origin_text": "Indonesia",
+              "origin_code_raw": "ID",
+              "legal_base": "Regulation 0159/19",
+              "regulation": null,
+              "additional_code": null,
+              "order_no": "098426",
+              "duty_text": "0.000 %"
+            }
+          }
+        ]
+      },
+      {
+        "origin_code": "IL",
+        "origin_name": "IL",
+        "origin_code_type": "country",
+        "measure_types": [
+          "PREFERENTIAL"
+        ],
+        "records": [
+          {
+            "hs_code": "7200000000",
+            "market": "EU",
+            "origin_code": "IL",
+            "origin_name": "IL",
+            "origin_code_type": "country",
+            "measure_type": "PREFERENTIAL",
+            "rate_basis": "bilateral_preference",
+            "duty_rate": 0,
+            "duty_amount": null,
+            "rate_specific_unit": null,
+            "valid_from": "2023-05-16",
+            "valid_to": null,
+            "source": "TARIC",
+            "ingested_at": "2026-03-29T02:19:41.786262+00:00",
+            "details": {
+              "measure_type_text": "Tariff preference",
+              "measure_type_code": "142",
+              "origin_text": "Israel",
+              "origin_code_raw": "IL",
+              "legal_base": "Decision 0855/09",
+              "regulation": null,
+              "additional_code": null,
+              "order_no": null,
+              "duty_text": "0.000 %"
+            }
+          }
+        ]
+      },
+      {
+        "origin_code": "IN",
+        "origin_name": "IN",
+        "origin_code_type": "country",
+        "measure_types": [
+          "TARIFF_QUOTA"
+        ],
+        "records": [
+          {
+            "hs_code": "7208510000",
+            "market": "EU",
+            "origin_code": "IN",
+            "origin_name": "IN",
+            "origin_code_type": "country",
+            "measure_type": "TARIFF_QUOTA",
+            "rate_basis": "tariff_quota",
+            "duty_rate": 0,
+            "duty_amount": null,
+            "rate_specific_unit": null,
+            "valid_from": "2025-04-01",
+            "valid_to": "2026-06-30",
+            "source": "TARIC",
+            "ingested_at": "2026-03-29T02:19:46.878214+00:00",
+            "details": {
+              "measure_type_text": "Non preferential tariff quota",
+              "measure_type_code": "122",
+              "origin_text": "India",
+              "origin_code_raw": "IN",
+              "legal_base": "Regulation 0159/19",
+              "regulation": null,
+              "additional_code": null,
+              "order_no": "098425",
+              "duty_text": "0.000 %"
+            }
+          }
+        ]
+      },
+      {
+        "origin_code": "JO",
+        "origin_name": "JO",
+        "origin_code_type": "country",
+        "measure_types": [
+          "PREFERENTIAL"
+        ],
+        "records": [
+          {
+            "hs_code": "7200000000",
+            "market": "EU",
+            "origin_code": "JO",
+            "origin_name": "JO",
+            "origin_code_type": "country",
+            "measure_type": "PREFERENTIAL",
+            "rate_basis": "bilateral_preference",
+            "duty_rate": 0,
+            "duty_amount": null,
+            "rate_specific_unit": null,
+            "valid_from": "2002-05-01",
+            "valid_to": null,
+            "source": "TARIC",
+            "ingested_at": "2026-03-29T02:19:41.743699+00:00",
+            "details": {
+              "measure_type_text": "Tariff preference",
+              "measure_type_code": "142",
+              "origin_text": "Jordan",
+              "origin_code_raw": "JO",
+              "legal_base": "Decision 0357/02",
+              "regulation": null,
+              "additional_code": null,
+              "order_no": null,
+              "duty_text": "0.000 %"
+            }
+          }
+        ]
+      },
+      {
+        "origin_code": "KE",
+        "origin_name": "KE",
+        "origin_code_type": "country",
+        "measure_types": [
+          "PREFERENTIAL"
+        ],
+        "records": [
+          {
+            "hs_code": "7200000000",
+            "market": "EU",
+            "origin_code": "KE",
+            "origin_name": "KE",
+            "origin_code_type": "country",
+            "measure_type": "PREFERENTIAL",
+            "rate_basis": "bilateral_preference",
+            "duty_rate": 0,
+            "duty_amount": null,
+            "rate_specific_unit": null,
+            "valid_from": "2024-07-01",
+            "valid_to": null,
+            "source": "TARIC",
+            "ingested_at": "2026-03-29T02:19:41.753072+00:00",
+            "details": {
+              "measure_type_text": "Tariff preference",
+              "measure_type_code": "142",
+              "origin_text": "Kenya",
+              "origin_code_raw": "KE",
+              "legal_base": "Decision 1647/24",
+              "regulation": null,
+              "additional_code": null,
+              "order_no": null,
+              "duty_text": "0.000 %"
+            }
+          }
+        ]
+      },
+      {
+        "origin_code": "KP",
+        "origin_name": "KP",
+        "origin_code_type": "country",
+        "measure_types": [
+          "IMPORT_CONTROL"
+        ],
+        "records": [
+          {
+            "hs_code": "7208000000",
+            "market": "EU",
+            "origin_code": "KP",
+            "origin_name": "KP",
+            "origin_code_type": "country",
+            "measure_type": "IMPORT_CONTROL",
+            "rate_basis": "import_control",
+            "duty_rate": null,
+            "duty_amount": null,
+            "rate_specific_unit": null,
+            "valid_from": "2017-09-16",
+            "valid_to": null,
+            "source": "TARIC",
+            "ingested_at": "2026-03-29T02:19:43.672418+00:00",
+            "details": {
+              "measure_type_text": "Import control on restricted goods and technologies",
+              "measure_type_code": "711",
+              "origin_text": "North Korea (Democratic People’s Republic of Korea)",
+              "origin_code_raw": "KP",
+              "legal_base": "Regulation 1548/17",
+              "regulation": null,
+              "additional_code": null,
+              "order_no": null,
+              "duty_text": "Cond:  Y cert: Y-959 (29):; Y (09):"
+            }
+          }
+        ]
+      },
+      {
+        "origin_code": "KR",
+        "origin_name": "KR",
+        "origin_code_type": "country",
+        "measure_types": [
+          "PREFERENTIAL",
+          "TARIFF_QUOTA"
+        ],
+        "records": [
+          {
+            "hs_code": "7208510000",
+            "market": "EU",
+            "origin_code": "KR",
+            "origin_name": "KR",
+            "origin_code_type": "country",
+            "measure_type": "TARIFF_QUOTA",
+            "rate_basis": "tariff_quota",
+            "duty_rate": 0,
+            "duty_amount": null,
+            "rate_specific_unit": null,
+            "valid_from": "2025-04-01",
+            "valid_to": "2026-06-30",
+            "source": "TARIC",
+            "ingested_at": "2026-03-29T02:19:46.886063+00:00",
+            "details": {
+              "measure_type_text": "Non preferential tariff quota",
+              "measure_type_code": "122",
+              "origin_text": "Korea, Republic of (South Korea)",
+              "origin_code_raw": "KR",
+              "legal_base": "Regulation 0159/19",
+              "regulation": null,
+              "additional_code": null,
+              "order_no": "098427",
+              "duty_text": "0.000 %"
+            }
+          },
+          {
+            "hs_code": "7200000000",
+            "market": "EU",
+            "origin_code": "KR",
+            "origin_name": "KR",
+            "origin_code_type": "country",
+            "measure_type": "PREFERENTIAL",
+            "rate_basis": "bilateral_preference",
+            "duty_rate": 0,
+            "duty_amount": null,
+            "rate_specific_unit": null,
+            "valid_from": "2011-07-01",
+            "valid_to": null,
+            "source": "TARIC",
+            "ingested_at": "2026-03-29T02:19:41.750390+00:00",
+            "details": {
+              "measure_type_text": "Tariff preference",
+              "measure_type_code": "142",
+              "origin_text": "Korea, Republic of (South Korea)",
+              "origin_code_raw": "KR",
+              "legal_base": "Decision 0265/11",
+              "regulation": null,
+              "additional_code": null,
+              "order_no": null,
+              "duty_text": "0.000 %"
+            }
+          }
+        ]
+      },
+      {
+        "origin_code": "LB",
+        "origin_name": "LB",
+        "origin_code_type": "country",
+        "measure_types": [
+          "PREFERENTIAL"
+        ],
+        "records": [
+          {
+            "hs_code": "7200000000",
+            "market": "EU",
+            "origin_code": "LB",
+            "origin_name": "LB",
+            "origin_code_type": "country",
+            "measure_type": "PREFERENTIAL",
+            "rate_basis": "bilateral_preference",
+            "duty_rate": 0,
+            "duty_amount": null,
+            "rate_specific_unit": null,
+            "valid_from": "2006-04-01",
+            "valid_to": null,
+            "source": "TARIC",
+            "ingested_at": "2026-03-29T02:19:41.740986+00:00",
+            "details": {
+              "measure_type_text": "Tariff preference",
+              "measure_type_code": "142",
+              "origin_text": "Lebanon",
+              "origin_code_raw": "LB",
+              "legal_base": "Decision 0356/06",
+              "regulation": null,
+              "additional_code": null,
+              "order_no": null,
+              "duty_text": "0.000 %"
+            }
+          }
+        ]
+      },
+      {
+        "origin_code": "MA",
+        "origin_name": "MA",
+        "origin_code_type": "country",
+        "measure_types": [
+          "PREFERENTIAL"
+        ],
+        "records": [
+          {
+            "hs_code": "7200000000",
+            "market": "EU",
+            "origin_code": "MA",
+            "origin_name": "MA",
+            "origin_code_type": "country",
+            "measure_type": "PREFERENTIAL",
+            "rate_basis": "bilateral_preference",
+            "duty_rate": 0,
+            "duty_amount": null,
+            "rate_specific_unit": null,
+            "valid_from": "2000-03-01",
+            "valid_to": null,
+            "source": "TARIC",
+            "ingested_at": "2026-03-29T02:19:41.738251+00:00",
+            "details": {
+              "measure_type_text": "Tariff preference",
+              "measure_type_code": "142",
+              "origin_text": "Morocco",
+              "origin_code_raw": "MA",
+              "legal_base": "Decision 0204/00",
+              "regulation": null,
+              "additional_code": null,
+              "order_no": null,
+              "duty_text": "0.000 %"
+            }
+          }
+        ]
+      },
+      {
+        "origin_code": "PG",
+        "origin_name": "PG",
+        "origin_code_type": "country",
+        "measure_types": [
+          "PREFERENTIAL"
+        ],
+        "records": [
+          {
+            "hs_code": "7200000000",
+            "market": "EU",
+            "origin_code": "PG",
+            "origin_name": "PG",
+            "origin_code_type": "country",
+            "measure_type": "PREFERENTIAL",
+            "rate_basis": "bilateral_preference",
+            "duty_rate": 0,
+            "duty_amount": null,
+            "rate_specific_unit": null,
+            "valid_from": "2009-12-20",
+            "valid_to": null,
+            "source": "TARIC",
+            "ingested_at": "2026-03-29T02:19:41.792251+00:00",
+            "details": {
+              "measure_type_text": "Tariff preference",
+              "measure_type_code": "142",
+              "origin_text": "Papua New Guinea",
+              "origin_code_raw": "PG",
+              "legal_base": "Decision 0729/09",
+              "regulation": null,
+              "additional_code": null,
+              "order_no": null,
+              "duty_text": "0.000 %"
+            }
+          }
+        ]
+      },
+      {
+        "origin_code": "PS",
+        "origin_name": "PS",
+        "origin_code_type": "country",
+        "measure_types": [
+          "PREFERENTIAL"
+        ],
+        "records": [
+          {
+            "hs_code": "7200000000",
+            "market": "EU",
+            "origin_code": "PS",
+            "origin_name": "PS",
+            "origin_code_type": "country",
+            "measure_type": "PREFERENTIAL",
+            "rate_basis": "bilateral_preference",
+            "duty_rate": 0,
+            "duty_amount": null,
+            "rate_specific_unit": null,
+            "valid_from": "2003-12-07",
+            "valid_to": null,
+            "source": "TARIC",
+            "ingested_at": "2026-03-29T02:19:41.772224+00:00",
+            "details": {
+              "measure_type_text": "Tariff preference",
+              "measure_type_code": "142",
+              "origin_text": "Occupied palestinian Territory",
+              "origin_code_raw": "PS",
+              "legal_base": "Decision 0430/97",
+              "regulation": null,
+              "additional_code": null,
+              "order_no": null,
+              "duty_text": "0.000 %"
+            }
+          }
+        ]
+      },
+      {
+        "origin_code": "RU",
+        "origin_name": "RU",
+        "origin_code_type": "country",
+        "measure_types": [
+          "IMPORT_CONTROL"
+        ],
+        "records": [
+          {
+            "hs_code": "7208510000",
+            "market": "EU",
+            "origin_code": "RU",
+            "origin_name": "RU",
+            "origin_code_type": "country",
+            "measure_type": "IMPORT_CONTROL",
+            "rate_basis": "import_control",
+            "duty_rate": null,
+            "duty_amount": null,
+            "rate_specific_unit": null,
+            "valid_from": "2023-12-19",
+            "valid_to": "2026-12-31",
+            "source": "TARIC",
+            "ingested_at": "2026-03-29T02:19:46.904006+00:00",
+            "details": {
+              "measure_type_text": "Import control",
+              "measure_type_code": "763",
+              "origin_text": "Russian Federation",
+              "origin_code_raw": "RU",
+              "legal_base": "Regulation 0833/14",
+              "regulation": null,
+              "additional_code": null,
+              "order_no": null,
+              "duty_text": "Cond:  Y cert: L-139 (29):; Y cert: L-143 (29):; Y cert: Y-859 (29):; Y (09):"
+            }
+          }
+        ]
+      },
+      {
+        "origin_code": "SB",
+        "origin_name": "SB",
+        "origin_code_type": "country",
+        "measure_types": [
+          "PREFERENTIAL"
+        ],
+        "records": [
+          {
+            "hs_code": "7200000000",
+            "market": "EU",
+            "origin_code": "SB",
+            "origin_name": "SB",
+            "origin_code_type": "country",
+            "measure_type": "PREFERENTIAL",
+            "rate_basis": "bilateral_preference",
+            "duty_rate": 0,
+            "duty_amount": null,
+            "rate_specific_unit": null,
+            "valid_from": "2020-05-17",
+            "valid_to": null,
+            "source": "TARIC",
+            "ingested_at": "2026-03-29T02:19:41.789434+00:00",
+            "details": {
+              "measure_type_text": "Tariff preference",
+              "measure_type_code": "142",
+              "origin_text": "Solomon Islands",
+              "origin_code_raw": "SB",
+              "legal_base": "Decision 0729/09",
+              "regulation": null,
+              "additional_code": null,
+              "order_no": null,
+              "duty_text": "0.000 %"
+            }
+          }
+        ]
+      },
+      {
+        "origin_code": "TN",
+        "origin_name": "TN",
+        "origin_code_type": "country",
+        "measure_types": [
+          "PREFERENTIAL"
+        ],
+        "records": [
+          {
+            "hs_code": "7200000000",
+            "market": "EU",
+            "origin_code": "TN",
+            "origin_name": "TN",
+            "origin_code_type": "country",
+            "measure_type": "PREFERENTIAL",
+            "rate_basis": "bilateral_preference",
+            "duty_rate": 0,
+            "duty_amount": null,
+            "rate_specific_unit": null,
+            "valid_from": "1998-03-01",
+            "valid_to": null,
+            "source": "TARIC",
+            "ingested_at": "2026-03-29T02:19:41.735464+00:00",
+            "details": {
+              "measure_type_text": "Tariff preference",
+              "measure_type_code": "142",
+              "origin_text": "Tunisia",
+              "origin_code_raw": "TN",
+              "legal_base": "Decision 0238/98",
+              "regulation": null,
+              "additional_code": null,
+              "order_no": null,
+              "duty_text": "0.000 %"
+            }
+          }
+        ]
+      },
+      {
+        "origin_code": "TR",
+        "origin_name": "TR",
+        "origin_code_type": "country",
+        "measure_types": [
+          "TARIFF_QUOTA"
+        ],
+        "records": [
+          {
+            "hs_code": "7208510000",
+            "market": "EU",
+            "origin_code": "TR",
+            "origin_name": "TR",
+            "origin_code_type": "country",
+            "measure_type": "TARIFF_QUOTA",
+            "rate_basis": "tariff_quota",
+            "duty_rate": 0,
+            "duty_amount": null,
+            "rate_specific_unit": null,
+            "valid_from": "2025-07-08",
+            "valid_to": "2026-06-30",
+            "source": "TARIC",
+            "ingested_at": "2026-03-29T02:19:46.874650+00:00",
+            "details": {
+              "measure_type_text": "Non preferential tariff quota",
+              "measure_type_code": "122",
+              "origin_text": "Türkiye",
+              "origin_code_raw": "TR",
+              "legal_base": "Regulation 0159/19",
+              "regulation": null,
+              "additional_code": null,
+              "order_no": "098418",
+              "duty_text": "0.000 %"
+            }
+          }
+        ]
+      },
+      {
+        "origin_code": "UA",
+        "origin_name": "UA",
+        "origin_code_type": "country",
+        "measure_types": [
+          "IMPORT_CONTROL"
+        ],
+        "records": [
+          {
+            "hs_code": "7200000000",
+            "market": "EU",
+            "origin_code": "UA",
+            "origin_name": "UA",
+            "origin_code_type": "country",
+            "measure_type": "IMPORT_CONTROL",
+            "rate_basis": "import_control",
+            "duty_rate": null,
+            "duty_amount": null,
+            "rate_specific_unit": null,
+            "valid_from": "2025-01-01",
+            "valid_to": null,
+            "source": "TARIC",
+            "ingested_at": "2026-03-29T02:19:41.732025+00:00",
+            "details": {
+              "measure_type_text": "Import control",
+              "measure_type_code": "760",
+              "origin_text": "Ukraine",
+              "origin_code_raw": "UA",
+              "legal_base": "Regulation 0692/14",
+              "regulation": null,
+              "additional_code": null,
+              "order_no": null,
+              "duty_text": "Cond:  Y cert: Y-997 (26):; Y cert: U-078 (26):; Y cert: U-079 (26):; Y cert: N-954 (26):; Y cert: U-045 (26):; Y (06):"
+            }
+          },
+          {
+            "hs_code": "7200000000",
+            "market": "EU",
+            "origin_code": "UA",
+            "origin_name": "UA",
+            "origin_code_type": "country",
+            "measure_type": "IMPORT_CONTROL",
+            "rate_basis": "import_control",
+            "duty_rate": null,
+            "duty_amount": null,
+            "rate_specific_unit": null,
+            "valid_from": "2025-01-01",
+            "valid_to": null,
+            "source": "TARIC",
+            "ingested_at": "2026-03-29T02:19:41.725202+00:00",
+            "details": {
+              "measure_type_text": "Import control",
+              "measure_type_code": "762",
+              "origin_text": "Ukraine",
+              "origin_code_raw": "UA",
+              "legal_base": "Regulation 0263/22",
+              "regulation": null,
+              "additional_code": null,
+              "order_no": null,
+              "duty_text": "Cond:  Y cert: Y-984 (29):; Y cert: N-954 (29):; Y cert: U-045 (29):; Y cert: U-078 (29):; Y cert: U-079 (29):; Y (09):"
+            }
+          }
+        ]
+      },
+      {
+        "origin_code": "WS",
+        "origin_name": "WS",
+        "origin_code_type": "country",
+        "measure_types": [
+          "PREFERENTIAL"
+        ],
+        "records": [
+          {
+            "hs_code": "7200000000",
+            "market": "EU",
+            "origin_code": "WS",
+            "origin_name": "WS",
+            "origin_code_type": "country",
+            "measure_type": "PREFERENTIAL",
+            "rate_basis": "bilateral_preference",
+            "duty_rate": 0,
+            "duty_amount": null,
+            "rate_specific_unit": null,
+            "valid_from": "2018-12-31",
+            "valid_to": null,
+            "source": "TARIC",
+            "ingested_at": "2026-03-29T02:19:41.802409+00:00",
+            "details": {
+              "measure_type_text": "Tariff preference",
+              "measure_type_code": "142",
+              "origin_text": "Samoa",
+              "origin_code_raw": "WS",
+              "legal_base": "Decision 0729/09",
+              "regulation": null,
+              "additional_code": null,
+              "order_no": null,
+              "duty_text": "0.000 %"
+            }
+          }
+        ]
+      },
+      {
+        "origin_code": "XC",
+        "origin_name": "XC",
+        "origin_code_type": "country",
+        "measure_types": [
+          "PREFERENTIAL"
+        ],
+        "records": [
+          {
+            "hs_code": "7200000000",
+            "market": "EU",
+            "origin_code": "XC",
+            "origin_name": "XC",
+            "origin_code_type": "country",
+            "measure_type": "PREFERENTIAL",
+            "rate_basis": "bilateral_preference",
+            "duty_rate": 0,
+            "duty_amount": null,
+            "rate_specific_unit": null,
+            "valid_from": "2003-12-07",
+            "valid_to": null,
+            "source": "TARIC",
+            "ingested_at": "2026-03-29T02:19:41.765565+00:00",
+            "details": {
+              "measure_type_text": "Tariff preference",
+              "measure_type_code": "142",
+              "origin_text": "Ceuta",
+              "origin_code_raw": "XC",
+              "legal_base": "Accession act 0001/85",
+              "regulation": null,
+              "additional_code": null,
+              "order_no": null,
+              "duty_text": "0.000 %"
+            }
+          }
+        ]
+      },
+      {
+        "origin_code": "XL",
+        "origin_name": "XL",
+        "origin_code_type": "country",
+        "measure_types": [
+          "PREFERENTIAL"
+        ],
+        "records": [
+          {
+            "hs_code": "7200000000",
+            "market": "EU",
+            "origin_code": "XL",
+            "origin_name": "XL",
+            "origin_code_type": "country",
+            "measure_type": "PREFERENTIAL",
+            "rate_basis": "bilateral_preference",
+            "duty_rate": 0,
+            "duty_amount": null,
+            "rate_specific_unit": null,
+            "valid_from": "2003-12-07",
+            "valid_to": null,
+            "source": "TARIC",
+            "ingested_at": "2026-03-29T02:19:41.769003+00:00",
+            "details": {
+              "measure_type_text": "Tariff preference",
+              "measure_type_code": "142",
+              "origin_text": "Melilla",
+              "origin_code_raw": "XL",
+              "legal_base": "Accession act 0001/85",
+              "regulation": null,
+              "additional_code": null,
+              "order_no": null,
+              "duty_text": "0.000 %"
+            }
+          }
+        ]
+      }
+    ],
+    "records": [],
+    "measures_by_type": {
+      "IMPORT_CONTROL": [
+        {
+          "hs_code": "7208510000",
+          "market": "EU",
+          "origin_code": "1008",
+          "origin_name": "All third countries",
+          "origin_code_type": "group_numeric",
+          "measure_type": "IMPORT_CONTROL",
+          "rate_basis": "import_control",
+          "duty_rate": null,
+          "duty_amount": null,
+          "rate_specific_unit": null,
+          "valid_from": "2023-12-19",
+          "valid_to": "2026-12-31",
+          "source": "TARIC",
+          "ingested_at": "2026-03-29T02:19:46.912261+00:00",
+          "details": {
+            "measure_type_text": "Import control",
+            "measure_type_code": "763",
+            "origin_text": "All third countries",
+            "origin_code_raw": "1008",
+            "legal_base": "Regulation 0833/14",
+            "regulation": null,
+            "additional_code": null,
+            "order_no": null,
+            "duty_text": "Cond:  Y cert: L-139 (29):; Y cert: Y-824 (29):; Y cert: Y-878 (29):; Y cert: Y-859 (29):; Y cert: L-143 (29):; Y (09):"
+          }
+        },
+        {
+          "hs_code": "7208510000",
+          "market": "EU",
+          "origin_code": "RU",
+          "origin_name": "RU",
+          "origin_code_type": "country",
+          "measure_type": "IMPORT_CONTROL",
+          "rate_basis": "import_control",
+          "duty_rate": null,
+          "duty_amount": null,
+          "rate_specific_unit": null,
+          "valid_from": "2023-12-19",
+          "valid_to": "2026-12-31",
+          "source": "TARIC",
+          "ingested_at": "2026-03-29T02:19:46.904006+00:00",
+          "details": {
+            "measure_type_text": "Import control",
+            "measure_type_code": "763",
+            "origin_text": "Russian Federation",
+            "origin_code_raw": "RU",
+            "legal_base": "Regulation 0833/14",
+            "regulation": null,
+            "additional_code": null,
+            "order_no": null,
+            "duty_text": "Cond:  Y cert: L-139 (29):; Y cert: L-143 (29):; Y cert: Y-859 (29):; Y (09):"
+          }
+        },
+        {
+          "hs_code": "7208000000",
+          "market": "EU",
+          "origin_code": "KP",
+          "origin_name": "KP",
+          "origin_code_type": "country",
+          "measure_type": "IMPORT_CONTROL",
+          "rate_basis": "import_control",
+          "duty_rate": null,
+          "duty_amount": null,
+          "rate_specific_unit": null,
+          "valid_from": "2017-09-16",
+          "valid_to": null,
+          "source": "TARIC",
+          "ingested_at": "2026-03-29T02:19:43.672418+00:00",
+          "details": {
+            "measure_type_text": "Import control on restricted goods and technologies",
+            "measure_type_code": "711",
+            "origin_text": "North Korea (Democratic People’s Republic of Korea)",
+            "origin_code_raw": "KP",
+            "legal_base": "Regulation 1548/17",
+            "regulation": null,
+            "additional_code": null,
+            "order_no": null,
+            "duty_text": "Cond:  Y cert: Y-959 (29):; Y (09):"
+          }
+        },
+        {
+          "hs_code": "7200000000",
+          "market": "EU",
+          "origin_code": "UA",
+          "origin_name": "UA",
+          "origin_code_type": "country",
+          "measure_type": "IMPORT_CONTROL",
+          "rate_basis": "import_control",
+          "duty_rate": null,
+          "duty_amount": null,
+          "rate_specific_unit": null,
+          "valid_from": "2025-01-01",
+          "valid_to": null,
+          "source": "TARIC",
+          "ingested_at": "2026-03-29T02:19:41.732025+00:00",
+          "details": {
+            "measure_type_text": "Import control",
+            "measure_type_code": "760",
+            "origin_text": "Ukraine",
+            "origin_code_raw": "UA",
+            "legal_base": "Regulation 0692/14",
+            "regulation": null,
+            "additional_code": null,
+            "order_no": null,
+            "duty_text": "Cond:  Y cert: Y-997 (26):; Y cert: U-078 (26):; Y cert: U-079 (26):; Y cert: N-954 (26):; Y cert: U-045 (26):; Y (06):"
+          }
+        },
+        {
+          "hs_code": "7200000000",
+          "market": "EU",
+          "origin_code": "UA",
+          "origin_name": "UA",
+          "origin_code_type": "country",
+          "measure_type": "IMPORT_CONTROL",
+          "rate_basis": "import_control",
+          "duty_rate": null,
+          "duty_amount": null,
+          "rate_specific_unit": null,
+          "valid_from": "2025-01-01",
+          "valid_to": null,
+          "source": "TARIC",
+          "ingested_at": "2026-03-29T02:19:41.725202+00:00",
+          "details": {
+            "measure_type_text": "Import control",
+            "measure_type_code": "762",
+            "origin_text": "Ukraine",
+            "origin_code_raw": "UA",
+            "legal_base": "Regulation 0263/22",
+            "regulation": null,
+            "additional_code": null,
+            "order_no": null,
+            "duty_text": "Cond:  Y cert: Y-984 (29):; Y cert: N-954 (29):; Y cert: U-045 (29):; Y cert: U-078 (29):; Y cert: U-079 (29):; Y (09):"
+          }
+        }
+      ],
+      "SAFEGUARD": [
+        {
+          "hs_code": "7208510000",
+          "market": "EU",
+          "origin_code": "5005",
+          "origin_name": "5005",
+          "origin_code_type": "safeguard",
+          "measure_type": "SAFEGUARD",
+          "rate_basis": "safeguard",
+          "duty_rate": 25,
+          "duty_amount": null,
+          "rate_specific_unit": null,
+          "valid_from": "2025-04-01",
+          "valid_to": "2026-06-30",
+          "source": "TARIC",
+          "ingested_at": "2026-03-29T02:19:46.897504+00:00",
+          "details": {
+            "measure_type_text": "Additional duties (safeguard)",
+            "measure_type_code": "696",
+            "origin_text": "Countries subject to safeguard measures",
+            "origin_code_raw": "5005",
+            "legal_base": "Regulation 0159/19",
+            "regulation": null,
+            "additional_code": null,
+            "order_no": null,
+            "duty_text": "25.000 %"
+          }
+        }
+      ],
+      "TARIFF_QUOTA": [
+        {
+          "hs_code": "7208510000",
+          "market": "EU",
+          "origin_code": "5005",
+          "origin_name": "5005",
+          "origin_code_type": "safeguard",
+          "measure_type": "TARIFF_QUOTA",
+          "rate_basis": "tariff_quota",
+          "duty_rate": 0,
+          "duty_amount": null,
+          "rate_specific_unit": null,
+          "valid_from": "2025-07-08",
+          "valid_to": "2026-03-31",
+          "source": "TARIC",
+          "ingested_at": "2026-03-29T02:19:46.889824+00:00",
+          "details": {
+            "measure_type_text": "Non preferential tariff quota",
+            "measure_type_code": "122",
+            "origin_text": "Countries subject to safeguard measures",
+            "origin_code_raw": "5005",
+            "legal_base": "Regulation 0159/19",
+            "regulation": null,
+            "additional_code": null,
+            "order_no": "098617",
+            "duty_text": "0.000 %"
+          }
+        },
+        {
+          "hs_code": "7208510000",
+          "market": "EU",
+          "origin_code": "KR",
+          "origin_name": "KR",
+          "origin_code_type": "country",
+          "measure_type": "TARIFF_QUOTA",
+          "rate_basis": "tariff_quota",
+          "duty_rate": 0,
+          "duty_amount": null,
+          "rate_specific_unit": null,
+          "valid_from": "2025-04-01",
+          "valid_to": "2026-06-30",
+          "source": "TARIC",
+          "ingested_at": "2026-03-29T02:19:46.886063+00:00",
+          "details": {
+            "measure_type_text": "Non preferential tariff quota",
+            "measure_type_code": "122",
+            "origin_text": "Korea, Republic of (South Korea)",
+            "origin_code_raw": "KR",
+            "legal_base": "Regulation 0159/19",
+            "regulation": null,
+            "additional_code": null,
+            "order_no": "098427",
+            "duty_text": "0.000 %"
+          }
+        },
+        {
+          "hs_code": "7208510000",
+          "market": "EU",
+          "origin_code": "ID",
+          "origin_name": "ID",
+          "origin_code_type": "country",
+          "measure_type": "TARIFF_QUOTA",
+          "rate_basis": "tariff_quota",
+          "duty_rate": 0,
+          "duty_amount": null,
+          "rate_specific_unit": null,
+          "valid_from": "2025-04-01",
+          "valid_to": "2026-06-30",
+          "source": "TARIC",
+          "ingested_at": "2026-03-29T02:19:46.881990+00:00",
+          "details": {
+            "measure_type_text": "Non preferential tariff quota",
+            "measure_type_code": "122",
+            "origin_text": "Indonesia",
+            "origin_code_raw": "ID",
+            "legal_base": "Regulation 0159/19",
+            "regulation": null,
+            "additional_code": null,
+            "order_no": "098426",
+            "duty_text": "0.000 %"
+          }
+        },
+        {
+          "hs_code": "7208510000",
+          "market": "EU",
+          "origin_code": "IN",
+          "origin_name": "IN",
+          "origin_code_type": "country",
+          "measure_type": "TARIFF_QUOTA",
+          "rate_basis": "tariff_quota",
+          "duty_rate": 0,
+          "duty_amount": null,
+          "rate_specific_unit": null,
+          "valid_from": "2025-04-01",
+          "valid_to": "2026-06-30",
+          "source": "TARIC",
+          "ingested_at": "2026-03-29T02:19:46.878214+00:00",
+          "details": {
+            "measure_type_text": "Non preferential tariff quota",
+            "measure_type_code": "122",
+            "origin_text": "India",
+            "origin_code_raw": "IN",
+            "legal_base": "Regulation 0159/19",
+            "regulation": null,
+            "additional_code": null,
+            "order_no": "098425",
+            "duty_text": "0.000 %"
+          }
+        },
+        {
+          "hs_code": "7208510000",
+          "market": "EU",
+          "origin_code": "TR",
+          "origin_name": "TR",
+          "origin_code_type": "country",
+          "measure_type": "TARIFF_QUOTA",
+          "rate_basis": "tariff_quota",
+          "duty_rate": 0,
+          "duty_amount": null,
+          "rate_specific_unit": null,
+          "valid_from": "2025-07-08",
+          "valid_to": "2026-06-30",
+          "source": "TARIC",
+          "ingested_at": "2026-03-29T02:19:46.874650+00:00",
+          "details": {
+            "measure_type_text": "Non preferential tariff quota",
+            "measure_type_code": "122",
+            "origin_text": "Türkiye",
+            "origin_code_raw": "TR",
+            "legal_base": "Regulation 0159/19",
+            "regulation": null,
+            "additional_code": null,
+            "order_no": "098418",
+            "duty_text": "0.000 %"
+          }
+        }
+      ],
+      "SUSPENSION": [
+        {
+          "hs_code": "7208000000",
+          "market": "EU",
+          "origin_code": "1011",
+          "origin_name": "ERGA OMNES",
+          "origin_code_type": "erga_omnes",
+          "measure_type": "SUSPENSION",
+          "rate_basis": "MFN",
+          "duty_rate": 0,
+          "duty_amount": null,
+          "rate_specific_unit": null,
+          "valid_from": "2016-07-01",
+          "valid_to": null,
+          "source": "TARIC",
+          "ingested_at": "2026-03-29T02:19:43.668137+00:00",
+          "details": {
+            "measure_type_text": "Suspension - goods for certain categories of ships, boats and other vessels and for drilling or production platforms",
+            "measure_type_code": "117",
+            "origin_text": "ERGA OMNES",
+            "origin_code_raw": "1011",
+            "legal_base": "Regulation 2658/87",
+            "regulation": null,
+            "additional_code": null,
+            "order_no": null,
+            "duty_text": "0.000 %"
+          }
+        }
+      ],
+      "MFN": [
+        {
+          "hs_code": "7208000000",
+          "market": "EU",
+          "origin_code": "1011",
+          "origin_name": "ERGA OMNES",
+          "origin_code_type": "erga_omnes",
+          "measure_type": "MFN",
+          "rate_basis": "MFN",
+          "duty_rate": 0,
+          "duty_amount": null,
+          "rate_specific_unit": null,
+          "valid_from": "2005-01-01",
+          "valid_to": null,
+          "source": "TARIC",
+          "ingested_at": "2026-03-29T02:19:43.664808+00:00",
+          "details": {
+            "measure_type_text": "Third country duty",
+            "measure_type_code": "103",
+            "origin_text": "ERGA OMNES",
+            "origin_code_raw": "1011",
+            "legal_base": "Regulation 1789/03",
+            "regulation": null,
+            "additional_code": null,
+            "order_no": null,
+            "duty_text": "0.000 %"
+          }
+        }
+      ],
+      "PREFERENTIAL": [
+        {
+          "hs_code": "7200000000",
+          "market": "EU",
+          "origin_code": "WS",
+          "origin_name": "WS",
+          "origin_code_type": "country",
+          "measure_type": "PREFERENTIAL",
+          "rate_basis": "bilateral_preference",
+          "duty_rate": 0,
+          "duty_amount": null,
+          "rate_specific_unit": null,
+          "valid_from": "2018-12-31",
+          "valid_to": null,
+          "source": "TARIC",
+          "ingested_at": "2026-03-29T02:19:41.802409+00:00",
+          "details": {
+            "measure_type_text": "Tariff preference",
+            "measure_type_code": "142",
+            "origin_text": "Samoa",
+            "origin_code_raw": "WS",
+            "legal_base": "Decision 0729/09",
+            "regulation": null,
+            "additional_code": null,
+            "order_no": null,
+            "duty_text": "0.000 %"
+          }
+        },
+        {
+          "hs_code": "7200000000",
+          "market": "EU",
+          "origin_code": "1033",
+          "origin_name": "1033",
+          "origin_code_type": "group_numeric",
+          "measure_type": "PREFERENTIAL",
+          "rate_basis": "group_preference",
+          "duty_rate": 0,
+          "duty_amount": null,
+          "rate_specific_unit": null,
+          "valid_from": "2008-12-29",
+          "valid_to": null,
+          "source": "TARIC",
+          "ingested_at": "2026-03-29T02:19:41.799604+00:00",
+          "details": {
+            "measure_type_text": "Tariff preference",
+            "measure_type_code": "142",
+            "origin_text": "CARIFORUM",
+            "origin_code_raw": "1033",
+            "legal_base": "Decision 0805/08",
+            "regulation": null,
+            "additional_code": null,
+            "order_no": null,
+            "duty_text": "0.000 %"
+          }
+        },
+        {
+          "hs_code": "7200000000",
+          "market": "EU",
+          "origin_code": "FJ",
+          "origin_name": "FJ",
+          "origin_code_type": "country",
+          "measure_type": "PREFERENTIAL",
+          "rate_basis": "bilateral_preference",
+          "duty_rate": 0,
+          "duty_amount": null,
+          "rate_specific_unit": null,
+          "valid_from": "2014-07-28",
+          "valid_to": null,
+          "source": "TARIC",
+          "ingested_at": "2026-03-29T02:19:41.795223+00:00",
+          "details": {
+            "measure_type_text": "Tariff preference",
+            "measure_type_code": "142",
+            "origin_text": "Fiji",
+            "origin_code_raw": "FJ",
+            "legal_base": "Decision 0729/09",
+            "regulation": null,
+            "additional_code": null,
+            "order_no": null,
+            "duty_text": "0.000 %"
+          }
+        },
+        {
+          "hs_code": "7200000000",
+          "market": "EU",
+          "origin_code": "PG",
+          "origin_name": "PG",
+          "origin_code_type": "country",
+          "measure_type": "PREFERENTIAL",
+          "rate_basis": "bilateral_preference",
+          "duty_rate": 0,
+          "duty_amount": null,
+          "rate_specific_unit": null,
+          "valid_from": "2009-12-20",
+          "valid_to": null,
+          "source": "TARIC",
+          "ingested_at": "2026-03-29T02:19:41.792251+00:00",
+          "details": {
+            "measure_type_text": "Tariff preference",
+            "measure_type_code": "142",
+            "origin_text": "Papua New Guinea",
+            "origin_code_raw": "PG",
+            "legal_base": "Decision 0729/09",
+            "regulation": null,
+            "additional_code": null,
+            "order_no": null,
+            "duty_text": "0.000 %"
+          }
+        },
+        {
+          "hs_code": "7200000000",
+          "market": "EU",
+          "origin_code": "SB",
+          "origin_name": "SB",
+          "origin_code_type": "country",
+          "measure_type": "PREFERENTIAL",
+          "rate_basis": "bilateral_preference",
+          "duty_rate": 0,
+          "duty_amount": null,
+          "rate_specific_unit": null,
+          "valid_from": "2020-05-17",
+          "valid_to": null,
+          "source": "TARIC",
+          "ingested_at": "2026-03-29T02:19:41.789434+00:00",
+          "details": {
+            "measure_type_text": "Tariff preference",
+            "measure_type_code": "142",
+            "origin_text": "Solomon Islands",
+            "origin_code_raw": "SB",
+            "legal_base": "Decision 0729/09",
+            "regulation": null,
+            "additional_code": null,
+            "order_no": null,
+            "duty_text": "0.000 %"
+          }
+        },
+        {
+          "hs_code": "7200000000",
+          "market": "EU",
+          "origin_code": "IL",
+          "origin_name": "IL",
+          "origin_code_type": "country",
+          "measure_type": "PREFERENTIAL",
+          "rate_basis": "bilateral_preference",
+          "duty_rate": 0,
+          "duty_amount": null,
+          "rate_specific_unit": null,
+          "valid_from": "2023-05-16",
+          "valid_to": null,
+          "source": "TARIC",
+          "ingested_at": "2026-03-29T02:19:41.786262+00:00",
+          "details": {
+            "measure_type_text": "Tariff preference",
+            "measure_type_code": "142",
+            "origin_text": "Israel",
+            "origin_code_raw": "IL",
+            "legal_base": "Decision 0855/09",
+            "regulation": null,
+            "additional_code": null,
+            "order_no": null,
+            "duty_text": "0.000 %"
+          }
+        },
+        {
+          "hs_code": "7200000000",
+          "market": "EU",
+          "origin_code": "GH",
+          "origin_name": "GH",
+          "origin_code_type": "country",
+          "measure_type": "PREFERENTIAL",
+          "rate_basis": "bilateral_preference",
+          "duty_rate": 0,
+          "duty_amount": null,
+          "rate_specific_unit": null,
+          "valid_from": "2016-12-15",
+          "valid_to": null,
+          "source": "TARIC",
+          "ingested_at": "2026-03-29T02:19:41.783366+00:00",
+          "details": {
+            "measure_type_text": "Tariff preference",
+            "measure_type_code": "142",
+            "origin_text": "Ghana",
+            "origin_code_raw": "GH",
+            "legal_base": "Decision 1850/16",
+            "regulation": null,
+            "additional_code": null,
+            "order_no": null,
+            "duty_text": "0.000 %"
+          }
+        },
+        {
+          "hs_code": "7200000000",
+          "market": "EU",
+          "origin_code": "1034",
+          "origin_name": "1034",
+          "origin_code_type": "group_numeric",
+          "measure_type": "PREFERENTIAL",
+          "rate_basis": "group_preference",
+          "duty_rate": 0,
+          "duty_amount": null,
+          "rate_specific_unit": null,
+          "valid_from": "2012-05-14",
+          "valid_to": null,
+          "source": "TARIC",
+          "ingested_at": "2026-03-29T02:19:41.780391+00:00",
+          "details": {
+            "measure_type_text": "Tariff preference",
+            "measure_type_code": "142",
+            "origin_text": "Eastern and Southern Africa States",
+            "origin_code_raw": "1034",
+            "legal_base": "Decision 0196/12",
+            "regulation": null,
+            "additional_code": null,
+            "order_no": null,
+            "duty_text": "0.000 %"
+          }
+        },
+        {
+          "hs_code": "7200000000",
+          "market": "EU",
+          "origin_code": "1035",
+          "origin_name": "1035",
+          "origin_code_type": "group_numeric",
+          "measure_type": "PREFERENTIAL",
+          "rate_basis": "group_preference",
+          "duty_rate": 0,
+          "duty_amount": null,
+          "rate_specific_unit": null,
+          "valid_from": "2016-10-10",
+          "valid_to": null,
+          "source": "TARIC",
+          "ingested_at": "2026-03-29T02:19:41.776204+00:00",
+          "details": {
+            "measure_type_text": "Tariff preference",
+            "measure_type_code": "142",
+            "origin_text": "SADC EPA",
+            "origin_code_raw": "1035",
+            "legal_base": "Decision 1623/16",
+            "regulation": null,
+            "additional_code": null,
+            "order_no": null,
+            "duty_text": "0.000 %"
+          }
+        },
+        {
+          "hs_code": "7200000000",
+          "market": "EU",
+          "origin_code": "PS",
+          "origin_name": "PS",
+          "origin_code_type": "country",
+          "measure_type": "PREFERENTIAL",
+          "rate_basis": "bilateral_preference",
+          "duty_rate": 0,
+          "duty_amount": null,
+          "rate_specific_unit": null,
+          "valid_from": "2003-12-07",
+          "valid_to": null,
+          "source": "TARIC",
+          "ingested_at": "2026-03-29T02:19:41.772224+00:00",
+          "details": {
+            "measure_type_text": "Tariff preference",
+            "measure_type_code": "142",
+            "origin_text": "Occupied palestinian Territory",
+            "origin_code_raw": "PS",
+            "legal_base": "Decision 0430/97",
+            "regulation": null,
+            "additional_code": null,
+            "order_no": null,
+            "duty_text": "0.000 %"
+          }
+        },
+        {
+          "hs_code": "7200000000",
+          "market": "EU",
+          "origin_code": "XL",
+          "origin_name": "XL",
+          "origin_code_type": "country",
+          "measure_type": "PREFERENTIAL",
+          "rate_basis": "bilateral_preference",
+          "duty_rate": 0,
+          "duty_amount": null,
+          "rate_specific_unit": null,
+          "valid_from": "2003-12-07",
+          "valid_to": null,
+          "source": "TARIC",
+          "ingested_at": "2026-03-29T02:19:41.769003+00:00",
+          "details": {
+            "measure_type_text": "Tariff preference",
+            "measure_type_code": "142",
+            "origin_text": "Melilla",
+            "origin_code_raw": "XL",
+            "legal_base": "Accession act 0001/85",
+            "regulation": null,
+            "additional_code": null,
+            "order_no": null,
+            "duty_text": "0.000 %"
+          }
+        },
+        {
+          "hs_code": "7200000000",
+          "market": "EU",
+          "origin_code": "XC",
+          "origin_name": "XC",
+          "origin_code_type": "country",
+          "measure_type": "PREFERENTIAL",
+          "rate_basis": "bilateral_preference",
+          "duty_rate": 0,
+          "duty_amount": null,
+          "rate_specific_unit": null,
+          "valid_from": "2003-12-07",
+          "valid_to": null,
+          "source": "TARIC",
+          "ingested_at": "2026-03-29T02:19:41.765565+00:00",
+          "details": {
+            "measure_type_text": "Tariff preference",
+            "measure_type_code": "142",
+            "origin_text": "Ceuta",
+            "origin_code_raw": "XC",
+            "legal_base": "Accession act 0001/85",
+            "regulation": null,
+            "additional_code": null,
+            "order_no": null,
+            "duty_text": "0.000 %"
+          }
+        },
+        {
+          "hs_code": "7200000000",
+          "market": "EU",
+          "origin_code": "CM",
+          "origin_name": "CM",
+          "origin_code_type": "country",
+          "measure_type": "PREFERENTIAL",
+          "rate_basis": "bilateral_preference",
+          "duty_rate": 0,
+          "duty_amount": null,
+          "rate_specific_unit": null,
+          "valid_from": "2014-08-04",
+          "valid_to": null,
+          "source": "TARIC",
+          "ingested_at": "2026-03-29T02:19:41.762201+00:00",
+          "details": {
+            "measure_type_text": "Tariff preference",
+            "measure_type_code": "142",
+            "origin_text": "Cameroon",
+            "origin_code_raw": "CM",
+            "legal_base": "Decision 0152/09",
+            "regulation": null,
+            "additional_code": null,
+            "order_no": null,
+            "duty_text": "0.000 %"
+          }
+        },
+        {
+          "hs_code": "7200000000",
+          "market": "EU",
+          "origin_code": "2000",
+          "origin_name": "2000",
+          "origin_code_type": "group_numeric",
+          "measure_type": "PREFERENTIAL",
+          "rate_basis": "group_preference",
+          "duty_rate": 0,
+          "duty_amount": null,
+          "rate_specific_unit": null,
+          "valid_from": "2025-10-03",
+          "valid_to": null,
+          "source": "TARIC",
+          "ingested_at": "2026-03-29T02:19:41.759381+00:00",
+          "details": {
+            "measure_type_text": "Tariff preference",
+            "measure_type_code": "142",
+            "origin_text": "Preferential origin in accordance with the Agreement in the form of an Exchange of Letters between the European Union and the Kingdom of Morocco on the amendment of Protocols 1 and 4 to the Euro-Mediterranean Agreement establishing an association between the European Communities and their Member States, of the one part, and the Kingdom of Morocco, of the other part.",
+            "origin_code_raw": "2000",
+            "legal_base": "Decision 2022/25",
+            "regulation": null,
+            "additional_code": null,
+            "order_no": null,
+            "duty_text": "0.000 %"
+          }
+        },
+        {
+          "hs_code": "7200000000",
+          "market": "EU",
+          "origin_code": "CI",
+          "origin_name": "CI",
+          "origin_code_type": "country",
+          "measure_type": "PREFERENTIAL",
+          "rate_basis": "bilateral_preference",
+          "duty_rate": 0,
+          "duty_amount": null,
+          "rate_specific_unit": null,
+          "valid_from": "2019-12-02",
+          "valid_to": null,
+          "source": "TARIC",
+          "ingested_at": "2026-03-29T02:19:41.755777+00:00",
+          "details": {
+            "measure_type_text": "Tariff preference",
+            "measure_type_code": "142",
+            "origin_text": "Ivory Coast",
+            "origin_code_raw": "CI",
+            "legal_base": "Decision 0156/09",
+            "regulation": null,
+            "additional_code": null,
+            "order_no": null,
+            "duty_text": "0.000 %"
+          }
+        },
+        {
+          "hs_code": "7200000000",
+          "market": "EU",
+          "origin_code": "KE",
+          "origin_name": "KE",
+          "origin_code_type": "country",
+          "measure_type": "PREFERENTIAL",
+          "rate_basis": "bilateral_preference",
+          "duty_rate": 0,
+          "duty_amount": null,
+          "rate_specific_unit": null,
+          "valid_from": "2024-07-01",
+          "valid_to": null,
+          "source": "TARIC",
+          "ingested_at": "2026-03-29T02:19:41.753072+00:00",
+          "details": {
+            "measure_type_text": "Tariff preference",
+            "measure_type_code": "142",
+            "origin_text": "Kenya",
+            "origin_code_raw": "KE",
+            "legal_base": "Decision 1647/24",
+            "regulation": null,
+            "additional_code": null,
+            "order_no": null,
+            "duty_text": "0.000 %"
+          }
+        },
+        {
+          "hs_code": "7200000000",
+          "market": "EU",
+          "origin_code": "KR",
+          "origin_name": "KR",
+          "origin_code_type": "country",
+          "measure_type": "PREFERENTIAL",
+          "rate_basis": "bilateral_preference",
+          "duty_rate": 0,
+          "duty_amount": null,
+          "rate_specific_unit": null,
+          "valid_from": "2011-07-01",
+          "valid_to": null,
+          "source": "TARIC",
+          "ingested_at": "2026-03-29T02:19:41.750390+00:00",
+          "details": {
+            "measure_type_text": "Tariff preference",
+            "measure_type_code": "142",
+            "origin_text": "Korea, Republic of (South Korea)",
+            "origin_code_raw": "KR",
+            "legal_base": "Decision 0265/11",
+            "regulation": null,
+            "additional_code": null,
+            "order_no": null,
+            "duty_text": "0.000 %"
+          }
+        },
+        {
+          "hs_code": "7200000000",
+          "market": "EU",
+          "origin_code": "EG",
+          "origin_name": "EG",
+          "origin_code_type": "country",
+          "measure_type": "PREFERENTIAL",
+          "rate_basis": "bilateral_preference",
+          "duty_rate": 0,
+          "duty_amount": null,
+          "rate_specific_unit": null,
+          "valid_from": "2004-06-01",
+          "valid_to": null,
+          "source": "TARIC",
+          "ingested_at": "2026-03-29T02:19:41.747214+00:00",
+          "details": {
+            "measure_type_text": "Tariff preference",
+            "measure_type_code": "142",
+            "origin_text": "Egypt",
+            "origin_code_raw": "EG",
+            "legal_base": "Decision 0635/04",
+            "regulation": null,
+            "additional_code": null,
+            "order_no": null,
+            "duty_text": "0.000 %"
+          }
+        },
+        {
+          "hs_code": "7200000000",
+          "market": "EU",
+          "origin_code": "JO",
+          "origin_name": "JO",
+          "origin_code_type": "country",
+          "measure_type": "PREFERENTIAL",
+          "rate_basis": "bilateral_preference",
+          "duty_rate": 0,
+          "duty_amount": null,
+          "rate_specific_unit": null,
+          "valid_from": "2002-05-01",
+          "valid_to": null,
+          "source": "TARIC",
+          "ingested_at": "2026-03-29T02:19:41.743699+00:00",
+          "details": {
+            "measure_type_text": "Tariff preference",
+            "measure_type_code": "142",
+            "origin_text": "Jordan",
+            "origin_code_raw": "JO",
+            "legal_base": "Decision 0357/02",
+            "regulation": null,
+            "additional_code": null,
+            "order_no": null,
+            "duty_text": "0.000 %"
+          }
+        },
+        {
+          "hs_code": "7200000000",
+          "market": "EU",
+          "origin_code": "LB",
+          "origin_name": "LB",
+          "origin_code_type": "country",
+          "measure_type": "PREFERENTIAL",
+          "rate_basis": "bilateral_preference",
+          "duty_rate": 0,
+          "duty_amount": null,
+          "rate_specific_unit": null,
+          "valid_from": "2006-04-01",
+          "valid_to": null,
+          "source": "TARIC",
+          "ingested_at": "2026-03-29T02:19:41.740986+00:00",
+          "details": {
+            "measure_type_text": "Tariff preference",
+            "measure_type_code": "142",
+            "origin_text": "Lebanon",
+            "origin_code_raw": "LB",
+            "legal_base": "Decision 0356/06",
+            "regulation": null,
+            "additional_code": null,
+            "order_no": null,
+            "duty_text": "0.000 %"
+          }
+        },
+        {
+          "hs_code": "7200000000",
+          "market": "EU",
+          "origin_code": "MA",
+          "origin_name": "MA",
+          "origin_code_type": "country",
+          "measure_type": "PREFERENTIAL",
+          "rate_basis": "bilateral_preference",
+          "duty_rate": 0,
+          "duty_amount": null,
+          "rate_specific_unit": null,
+          "valid_from": "2000-03-01",
+          "valid_to": null,
+          "source": "TARIC",
+          "ingested_at": "2026-03-29T02:19:41.738251+00:00",
+          "details": {
+            "measure_type_text": "Tariff preference",
+            "measure_type_code": "142",
+            "origin_text": "Morocco",
+            "origin_code_raw": "MA",
+            "legal_base": "Decision 0204/00",
+            "regulation": null,
+            "additional_code": null,
+            "order_no": null,
+            "duty_text": "0.000 %"
+          }
+        },
+        {
+          "hs_code": "7200000000",
+          "market": "EU",
+          "origin_code": "TN",
+          "origin_name": "TN",
+          "origin_code_type": "country",
+          "measure_type": "PREFERENTIAL",
+          "rate_basis": "bilateral_preference",
+          "duty_rate": 0,
+          "duty_amount": null,
+          "rate_specific_unit": null,
+          "valid_from": "1998-03-01",
+          "valid_to": null,
+          "source": "TARIC",
+          "ingested_at": "2026-03-29T02:19:41.735464+00:00",
+          "details": {
+            "measure_type_text": "Tariff preference",
+            "measure_type_code": "142",
+            "origin_text": "Tunisia",
+            "origin_code_raw": "TN",
+            "legal_base": "Decision 0238/98",
+            "regulation": null,
+            "additional_code": null,
+            "order_no": null,
+            "duty_text": "0.000 %"
+          }
+        },
+        {
+          "hs_code": "7200000000",
+          "market": "EU",
+          "origin_code": "GB",
+          "origin_name": "GB",
+          "origin_code_type": "country",
+          "measure_type": "PREFERENTIAL",
+          "rate_basis": "bilateral_preference",
+          "duty_rate": 0,
+          "duty_amount": null,
+          "rate_specific_unit": null,
+          "valid_from": "2021-01-01",
+          "valid_to": null,
+          "source": "TARIC",
+          "ingested_at": "2026-03-29T02:19:41.718056+00:00",
+          "details": {
+            "measure_type_text": "Tariff preference",
+            "measure_type_code": "142",
+            "origin_text": "United Kingdom",
+            "origin_code_raw": "GB",
+            "legal_base": "Decision 2253/20",
+            "regulation": null,
+            "additional_code": null,
+            "order_no": null,
+            "duty_text": "0.000 %"
+          }
+        },
+        {
+          "hs_code": "7200000000",
+          "market": "EU",
+          "origin_code": "2005",
+          "origin_name": "2005",
+          "origin_code_type": "group_numeric",
+          "measure_type": "PREFERENTIAL",
+          "rate_basis": "group_preference",
+          "duty_rate": 0,
+          "duty_amount": null,
+          "rate_specific_unit": null,
+          "valid_from": "2014-01-01",
+          "valid_to": null,
+          "source": "TARIC",
+          "ingested_at": "2026-03-29T02:19:41.715058+00:00",
+          "details": {
+            "measure_type_text": "Tariff preference",
+            "measure_type_code": "142",
+            "origin_text": "GSP-EBA (Special arrangement for the least-developed countries - Everything But Arms)",
+            "origin_code_raw": "2005",
+            "legal_base": "Regulation 0978/12",
+            "regulation": null,
+            "additional_code": null,
+            "order_no": null,
+            "duty_text": "0.000 %"
+          }
+        }
+      ]
+    },
+    "certificate_codes": [
+      "L-139",
+      "L-143",
+      "N-954",
+      "U-045",
+      "U-078",
+      "U-079",
+      "Y-824",
+      "Y-859",
+      "Y-878",
+      "Y-959",
+      "Y-984",
+      "Y-997"
+    ],
+    "certificate_details": {
+      "Y-984": "Unknown — code Y-984",
+      "N-954": "Unknown — code N-954",
+      "U-045": "Unknown — code U-045",
+      "U-078": "Unknown — code U-078",
+      "U-079": "Unknown — code U-079",
+      "Y-997": "Unknown — code Y-997",
+      "L-143": "Unknown — code L-143",
+      "Y-859": "Unknown — code Y-859",
+      "Y-959": "Unknown — code Y-959",
+      "L-139": "Unknown — code L-139",
+      "Y-824": "Unknown — code Y-824",
+      "Y-878": "Unknown — code Y-878"
+    },
+    "stacked_measures": [
+      {
+        "hs_code": "7208510000",
+        "market": "EU",
+        "origin_code": "1008",
+        "origin_name": "All third countries",
+        "origin_code_type": "group_numeric",
+        "measure_type": "IMPORT_CONTROL",
+        "rate_basis": "import_control",
+        "duty_rate": null,
+        "duty_amount": null,
+        "rate_specific_unit": null,
+        "valid_from": "2023-12-19",
+        "valid_to": "2026-12-31",
+        "source": "TARIC",
+        "ingested_at": "2026-03-29T02:19:46.912261+00:00",
+        "details": {
+          "measure_type_text": "Import control",
+          "measure_type_code": "763",
+          "origin_text": "All third countries",
+          "origin_code_raw": "1008",
+          "legal_base": "Regulation 0833/14",
+          "regulation": null,
+          "additional_code": null,
+          "order_no": null,
+          "duty_text": "Cond:  Y cert: L-139 (29):; Y cert: Y-824 (29):; Y cert: Y-878 (29):; Y cert: Y-859 (29):; Y cert: L-143 (29):; Y (09):"
+        }
+      },
+      {
+        "hs_code": "7208510000",
+        "market": "EU",
+        "origin_code": "RU",
+        "origin_name": "RU",
+        "origin_code_type": "country",
+        "measure_type": "IMPORT_CONTROL",
+        "rate_basis": "import_control",
+        "duty_rate": null,
+        "duty_amount": null,
+        "rate_specific_unit": null,
+        "valid_from": "2023-12-19",
+        "valid_to": "2026-12-31",
+        "source": "TARIC",
+        "ingested_at": "2026-03-29T02:19:46.904006+00:00",
+        "details": {
+          "measure_type_text": "Import control",
+          "measure_type_code": "763",
+          "origin_text": "Russian Federation",
+          "origin_code_raw": "RU",
+          "legal_base": "Regulation 0833/14",
+          "regulation": null,
+          "additional_code": null,
+          "order_no": null,
+          "duty_text": "Cond:  Y cert: L-139 (29):; Y cert: L-143 (29):; Y cert: Y-859 (29):; Y (09):"
+        }
+      },
+      {
+        "hs_code": "7208510000",
+        "market": "EU",
+        "origin_code": "5005",
+        "origin_name": "5005",
+        "origin_code_type": "safeguard",
+        "measure_type": "SAFEGUARD",
+        "rate_basis": "safeguard",
+        "duty_rate": 25,
+        "duty_amount": null,
+        "rate_specific_unit": null,
+        "valid_from": "2025-04-01",
+        "valid_to": "2026-06-30",
+        "source": "TARIC",
+        "ingested_at": "2026-03-29T02:19:46.897504+00:00",
+        "details": {
+          "measure_type_text": "Additional duties (safeguard)",
+          "measure_type_code": "696",
+          "origin_text": "Countries subject to safeguard measures",
+          "origin_code_raw": "5005",
+          "legal_base": "Regulation 0159/19",
+          "regulation": null,
+          "additional_code": null,
+          "order_no": null,
+          "duty_text": "25.000 %"
+        }
+      },
+      {
+        "hs_code": "7208000000",
+        "market": "EU",
+        "origin_code": "KP",
+        "origin_name": "KP",
+        "origin_code_type": "country",
+        "measure_type": "IMPORT_CONTROL",
+        "rate_basis": "import_control",
+        "duty_rate": null,
+        "duty_amount": null,
+        "rate_specific_unit": null,
+        "valid_from": "2017-09-16",
+        "valid_to": null,
+        "source": "TARIC",
+        "ingested_at": "2026-03-29T02:19:43.672418+00:00",
+        "details": {
+          "measure_type_text": "Import control on restricted goods and technologies",
+          "measure_type_code": "711",
+          "origin_text": "North Korea (Democratic People’s Republic of Korea)",
+          "origin_code_raw": "KP",
+          "legal_base": "Regulation 1548/17",
+          "regulation": null,
+          "additional_code": null,
+          "order_no": null,
+          "duty_text": "Cond:  Y cert: Y-959 (29):; Y (09):"
+        }
+      },
+      {
+        "hs_code": "7200000000",
+        "market": "EU",
+        "origin_code": "UA",
+        "origin_name": "UA",
+        "origin_code_type": "country",
+        "measure_type": "IMPORT_CONTROL",
+        "rate_basis": "import_control",
+        "duty_rate": null,
+        "duty_amount": null,
+        "rate_specific_unit": null,
+        "valid_from": "2025-01-01",
+        "valid_to": null,
+        "source": "TARIC",
+        "ingested_at": "2026-03-29T02:19:41.732025+00:00",
+        "details": {
+          "measure_type_text": "Import control",
+          "measure_type_code": "760",
+          "origin_text": "Ukraine",
+          "origin_code_raw": "UA",
+          "legal_base": "Regulation 0692/14",
+          "regulation": null,
+          "additional_code": null,
+          "order_no": null,
+          "duty_text": "Cond:  Y cert: Y-997 (26):; Y cert: U-078 (26):; Y cert: U-079 (26):; Y cert: N-954 (26):; Y cert: U-045 (26):; Y (06):"
+        }
+      },
+      {
+        "hs_code": "7200000000",
+        "market": "EU",
+        "origin_code": "UA",
+        "origin_name": "UA",
+        "origin_code_type": "country",
+        "measure_type": "IMPORT_CONTROL",
+        "rate_basis": "import_control",
+        "duty_rate": null,
+        "duty_amount": null,
+        "rate_specific_unit": null,
+        "valid_from": "2025-01-01",
+        "valid_to": null,
+        "source": "TARIC",
+        "ingested_at": "2026-03-29T02:19:41.725202+00:00",
+        "details": {
+          "measure_type_text": "Import control",
+          "measure_type_code": "762",
+          "origin_text": "Ukraine",
+          "origin_code_raw": "UA",
+          "legal_base": "Regulation 0263/22",
+          "regulation": null,
+          "additional_code": null,
+          "order_no": null,
+          "duty_text": "Cond:  Y cert: Y-984 (29):; Y cert: N-954 (29):; Y cert: U-045 (29):; Y cert: U-078 (29):; Y cert: U-079 (29):; Y (09):"
+        }
+      }
+    ],
+    "duty": {
+      "rate_type": "PREFERENTIAL",
+      "duty_rate": 0,
+      "duty_amount": null,
+      "currency": null,
+      "duty_unit": null,
+      "duty_unit_description": null,
+      "duty_amount_secondary": null,
+      "duty_unit_secondary": null,
+      "duty_min_amount": null,
+      "duty_max_amount": null,
+      "duty_min_rate": null,
+      "duty_max_rate": null,
+      "duty_max_total_rate": null,
+      "has_entry_price": false,
+      "entry_price_type": null,
+      "is_nihil": false,
+      "is_alcohol_duty": false,
+      "anti_dumping_specific": false,
+      "siv_bands": null,
+      "trade_agreement": null,
+      "financial_charge": true,
+      "source": "TARIC",
+      "origin_code": "GB",
+      "origin_name": "GB",
+      "rate_basis": "bilateral_preference",
+      "conditions": [],
+      "human_readable": "0%"
+    },
+    "vat": {
+      "country_code": "DE",
+      "rate_type": "standard",
+      "vat_rate": 19,
+      "hs_code_prefix": null,
+      "source": "euvatrates"
+    },
+    "calculated": {
+      "duty_on_goods_value_pct": 0,
+      "effective_duty_rate": null,
+      "effective_duty_amount": null,
+      "effective_duty_unit": null,
+      "variable_rate_evaluated": false,
+      "entry_price_component": false,
+      "vat_applies_to": "goods_value + duty",
+      "note": "VAT is assessed on CIF value + customs duty",
+      "has_mfn_via_walkup": false,
+      "mfn_duty": null,
+      "warnings": []
+    },
+    "data_freshness": {
+      "duty_last_updated": "2026-03-29",
+      "vat_last_updated": "2026-03-29"
+    },
+    "other_measures": [
+      {
+        "hs_code": "7208510000",
+        "destination_market": "EU",
+        "destination_country": "DE",
+        "origin_country": "1008",
+        "measure_type": "IMPORT_CONTROL",
+        "rate_ad_valorem": null,
+        "rate_specific_amount": null,
+        "rate_specific_unit": null,
+        "valid_from": "2023-12-19",
+        "valid_to": "2026-12-31",
+        "source": "TARIC",
+        "details": {
+          "order_no": null,
+          "add_code": null,
+          "legal_base": "Regulation 0833/14",
+          "duty_text": "Cond:  Y cert: L-139 (29):; Y cert: Y-824 (29):; Y cert: Y-878 (29):; Y cert: Y-859 (29):; Y cert: L-143 (29):; Y (09):",
+          "measure_type_text": "Import control",
+          "measure_type_code": "763",
+          "origin_text": "All third countries",
+          "origin_code": "1008"
+        }
+      }
+    ],
+    "tariff_quotas": [],
+    "non_tariff_measures": [
+      {
+        "hs_code": "7208510000",
+        "destination_market": "EU",
+        "destination_country": "DE",
+        "origin_country": "1008",
+        "measure_type": "IMPORT_CONTROL",
+        "rate_ad_valorem": null,
+        "rate_specific_amount": null,
+        "rate_specific_unit": null,
+        "valid_from": "2023-12-19",
+        "valid_to": "2026-12-31",
+        "source": "TARIC",
+        "details": {
+          "order_no": null,
+          "add_code": null,
+          "legal_base": "Regulation 0833/14",
+          "duty_text": "Cond:  Y cert: L-139 (29):; Y cert: Y-824 (29):; Y cert: Y-878 (29):; Y cert: Y-859 (29):; Y cert: L-143 (29):; Y (09):",
+          "measure_type_text": "Import control",
+          "measure_type_code": "763",
+          "origin_text": "All third countries",
+          "origin_code": "1008"
+        }
+      }
+    ],
+    "supplementary_units": [],
+    "price_measures": []
+  },
+  "meta": {
+    "request_id": "c6163414-9bed-4549-9e99-3d1c75361092",
+    "timestamp": "2026-03-29T02:30:42.740432+00:00"
+  }
+}
