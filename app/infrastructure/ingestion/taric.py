@@ -258,14 +258,15 @@ async def _upsert_measure(db: AsyncSession, *, row: dict[str, Any]) -> None:
     await db.execute(stmt)
 
 
-def _parse_goods_nomenclature(xml_path: str) -> dict[str, str]:
-    leaf: dict[str, str] = {}
+def _parse_goods_nomenclature(xml_path: str) -> tuple[dict[str, str], set[str]]:
+    codes: dict[str, str] = {}
+    leaf_codes: set[str] = set()
     for event, elem in iterparse(xml_path, events=("end",)):
         if _local(elem.tag) != "GOODS.NOMENCLATURE":
             continue
         hs = _digits(_first_text(elem, ("GOODS.NOMENCLATURE.ITEM.ID",)))
         suffix = _first_text(elem, ("PRODUCTLINE.SUFFIX",))
-        if not hs or suffix != "80":
+        if not hs:
             elem.clear()
             continue
         desc: str | None = None
@@ -275,9 +276,12 @@ def _parse_goods_nomenclature(xml_path: str) -> dict[str, str]:
                 if lang == "EN":
                     desc = _first_text(child, ("GOODS.NOMENCLATURE.DESCRIPTION",))
                     break
-        leaf[hs] = (desc or f"HS {hs}").strip()
+        if suffix == "80":
+            leaf_codes.add(hs)
+        if hs not in codes:
+            codes[hs] = (desc or f"HS {hs}").strip()
         elem.clear()
-    return leaf
+    return codes, leaf_codes
 
 
 def _extract_amount_fields(elem) -> tuple[Decimal | None, Decimal | None, str | None]:
@@ -381,13 +385,13 @@ def _parse_measure_conditions(elem) -> list[dict[str, Any]]:
     return [c for c in out if any(v for v in c.values())]
 
 
-def _parse_measures(xml_path: str, leaf_codes: set[str]) -> list[dict[str, Any]]:
+def _parse_measures(xml_path: str, valid_codes: set[str]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for event, elem in iterparse(xml_path, events=("end",)):
         if _local(elem.tag) != "MEASURE":
             continue
         hs = _digits(_first_text(elem, ("GOODS.NOMENCLATURE.ITEM.ID",)))
-        if not hs or hs not in leaf_codes:
+        if not hs or hs not in valid_codes:
             elem.clear()
             continue
         sid = _first_text(elem, ("MEASURE.SID",)) or f"TARIC:{hs}:{uuid4()}"
@@ -471,15 +475,15 @@ async def _run_taric_ingest(*, mode: str, delta_date: date | None) -> dict[str, 
                     "Day": f"{d.day:02d}",
                 }
             xml_path = await _download_taric_xml(params=params)
-            leaf_map = _parse_goods_nomenclature(xml_path)
-            leaf_codes = set(leaf_map.keys())
+            code_map, leaf_codes = _parse_goods_nomenclature(xml_path)
+            all_codes = set(code_map.keys())
 
-            hs_rows = [{"code": code, "description": desc, "valid_from": date.today()} for code, desc in leaf_map.items()]
+            hs_rows = [{"code": code, "description": desc, "valid_from": date.today()} for code, desc in code_map.items()]
             for i in range(0, len(hs_rows), 500):
                 await _upsert_hs_codes(db, hs_rows[i:i + 500])
                 await db.commit()
 
-            measures = _parse_measures(xml_path, leaf_codes)
+            measures = _parse_measures(xml_path, all_codes)
             for i in range(0, len(measures), 500):
                 for row in measures[i:i + 500]:
                     await _upsert_measure(db, row=row)
@@ -534,7 +538,7 @@ async def _run_taric_ingest(*, mode: str, delta_date: date | None) -> dict[str, 
                 "source": "TARIC",
                 "status": run.status,
                 "records_processed": len(measures),
-                "hs_codes": len(leaf_codes),
+                "hs_codes": len(all_codes),
                 "mfn_missing_count": mfn_missing_count,
                 "mfn_missing_sample": missing_mfn_sample,
             }
