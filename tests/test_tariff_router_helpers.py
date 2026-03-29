@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-from app.api.v1.tariff.router import _measure_has_any_duty
+from app.api.v1.tariff.router import _measure_has_any_duty, _normalize_origin_iso2
 
 
 def test_measure_has_any_duty_true_when_is_nihil() -> None:
@@ -29,3 +29,6 @@ def test_measure_has_any_duty_false_when_no_signals() -> None:
     )
     assert _measure_has_any_duty(m) is False
 
+
+def test_normalize_origin_iso2_uk_to_gb() -> None:
+    assert _normalize_origin_iso2("UK") == "GB"

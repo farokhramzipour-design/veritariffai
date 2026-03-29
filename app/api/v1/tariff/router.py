@@ -321,6 +321,50 @@ def _rate_basis_for_measure(*, measure_type: str | None, origin_code: str | None
     return mt.lower()
 
 
+def _measure_record(m: TariffMeasure, *, market: str, origin_map: dict[str, Origin]) -> dict:
+    origin_code_val = _measure_origin_code(m)
+    origin_row_val = origin_map.get(origin_code_val)
+    origin_name_val = (
+        origin_row_val.origin_name
+        if origin_row_val
+        else ("ERGA OMNES" if origin_code_val == "1011" else origin_code_val)
+    )
+    raw = m.raw_json if isinstance(m.raw_json, dict) else {}
+    duty_meta_entry = _measure_duty_meta(m)
+    duty_expr = (
+        duty_meta_entry.get("raw_expression")
+        if duty_meta_entry and isinstance(duty_meta_entry.get("raw_expression"), str)
+        else None
+    )
+    return {
+        "hs_code": m.hs_code,
+        "market": market,
+        "origin_code": origin_code_val,
+        "origin_name": origin_name_val,
+        "origin_code_type": origin_row_val.origin_code_type if origin_row_val else None,
+        "measure_type": m.measure_type,
+        "rate_basis": _rate_basis_for_measure(measure_type=m.measure_type, origin_code=origin_code_val),
+        "duty_rate": _measure_duty_rate_pct(m),
+        "duty_amount": float(m.rate_specific_amount) if m.rate_specific_amount is not None else None,
+        "rate_specific_unit": m.rate_specific_unit,
+        "valid_from": m.valid_from.isoformat() if m.valid_from else None,
+        "valid_to": m.valid_to.isoformat() if m.valid_to else None,
+        "source": m.source_dataset,
+        "ingested_at": m.ingested_at.isoformat() if m.ingested_at else None,
+        "details": {
+            "measure_type_text": raw.get("Measure type") or raw.get("measure_type_text"),
+            "measure_type_code": raw.get("Meas. type code") or raw.get("Meas type code") or raw.get("measure_type_id"),
+            "origin_text": raw.get("Origin") or raw.get("origin"),
+            "origin_code_raw": raw.get("Origin code") or raw.get("geographical_area_id"),
+            "legal_base": raw.get("Legal base") or raw.get("Legal basis") or raw.get("legal_base"),
+            "regulation": raw.get("Regulation") or raw.get("regulation"),
+            "additional_code": raw.get("Add code") or raw.get("Add code.") or raw.get("add_code"),
+            "order_no": raw.get("Order No.") or raw.get("Order No") or raw.get("Order number"),
+            "duty_text": raw.get("Duty") or duty_expr,
+        },
+    }
+
+
 async def _pick_best_duty(
     db: AsyncSession,
     *,
@@ -621,6 +665,12 @@ async def tariff_lookup(
         .order_by(sa.func.length(TariffMeasure.hs_code).desc(), TariffMeasure.ingested_at.desc())
     )
     all_measures = res.scalars().all()
+    all_origin_codes = sorted({_measure_origin_code(m) for m in all_measures if isinstance(m, TariffMeasure)})
+    if all_origin_codes:
+        res = await db.execute(select(Origin).where(Origin.origin_code.in_(all_origin_codes)))
+        all_origin_rows = res.scalars().all()
+        for o in all_origin_rows:
+            origin_map.setdefault(o.origin_code, o)
 
     res = await db.execute(select(HSCode.description).where(HSCode.code == hs).limit(1))
     description = res.scalar_one_or_none() or f"HS {hs}"
@@ -860,42 +910,7 @@ async def tariff_lookup(
 
     records: list[dict] = []
     if full_report:
-        def _record_for_measure(m: TariffMeasure) -> dict:
-            origin_code_val = _measure_origin_code(m)
-            origin_row_val = origin_map.get(origin_code_val)
-            origin_name_val = origin_row_val.origin_name if origin_row_val else ("ERGA OMNES" if origin_code_val == "1011" else origin_code_val)
-            raw = m.raw_json if isinstance(m.raw_json, dict) else {}
-            duty_meta_entry = _measure_duty_meta(m)
-            duty_expr = duty_meta_entry.get("raw_expression") if duty_meta_entry and isinstance(duty_meta_entry.get("raw_expression"), str) else None
-            return {
-                "hs_code": m.hs_code,
-                "market": market,
-                "origin_code": origin_code_val,
-                "origin_name": origin_name_val,
-                "origin_code_type": origin_row_val.origin_code_type if origin_row_val else None,
-                "measure_type": m.measure_type,
-                "rate_basis": _rate_basis_for_measure(measure_type=m.measure_type, origin_code=origin_code_val),
-                "duty_rate": _measure_duty_rate_pct(m),
-                "duty_amount": float(m.rate_specific_amount) if m.rate_specific_amount is not None else None,
-                "rate_specific_unit": m.rate_specific_unit,
-                "valid_from": m.valid_from.isoformat() if m.valid_from else None,
-                "valid_to": m.valid_to.isoformat() if m.valid_to else None,
-                "source": m.source_dataset,
-                "ingested_at": m.ingested_at.isoformat() if m.ingested_at else None,
-                "details": {
-                    "measure_type_text": raw.get("Measure type") or raw.get("measure_type_text"),
-                    "measure_type_code": raw.get("Meas. type code") or raw.get("Meas type code") or raw.get("measure_type_id"),
-                    "origin_text": raw.get("Origin") or raw.get("origin"),
-                    "origin_code_raw": raw.get("Origin code") or raw.get("geographical_area_id"),
-                    "legal_base": raw.get("Legal base") or raw.get("Legal basis") or raw.get("legal_base"),
-                    "regulation": raw.get("Regulation") or raw.get("regulation"),
-                    "additional_code": raw.get("Add code") or raw.get("Add code.") or raw.get("add_code"),
-                    "order_no": raw.get("Order No.") or raw.get("Order No") or raw.get("Order number"),
-                    "duty_text": raw.get("Duty") or duty_expr,
-                },
-            }
-
-        records = [_record_for_measure(m) for m in all_measures]
+        records = [_measure_record(m, market=market, origin_map=origin_map) for m in all_measures]
         records = sorted(
             records,
             key=lambda r: (
@@ -906,6 +921,29 @@ async def tariff_lookup(
             ),
             reverse=True,
         )[:300]
+
+    origin_matrix: list[dict] = []
+    if all_origin_codes:
+        by_origin: dict[str, list[TariffMeasure]] = {}
+        for m in all_measures:
+            oc = _measure_origin_code(m)
+            by_origin.setdefault(oc, []).append(m)
+        for oc in all_origin_codes:
+            row = origin_map.get(oc)
+            name = row.origin_name if row else ("ERGA OMNES" if oc == "1011" else oc)
+            code_type = row.origin_code_type if row else None
+            origin_matrix.append(
+                {
+                    "origin_code": oc,
+                    "origin_name": name,
+                    "origin_code_type": code_type,
+                    "measure_types": sorted({m.measure_type for m in by_origin.get(oc, []) if isinstance(m.measure_type, str)}),
+                    "records": [
+                        _measure_record(m, market=market, origin_map=origin_map)
+                        for m in sorted(by_origin.get(oc, []), key=lambda x: (x.valid_from, x.ingested_at), reverse=True)[:50]
+                    ],
+                }
+            )
 
     payload = {
         "hs_code": hs,
@@ -928,6 +966,8 @@ async def tariff_lookup(
         "origin_resolution": origin_resolution,
         "rates_by_origin": rates_by_origin,
         "best_rate": best_rate,
+        "available_origin_codes": all_origin_codes,
+        "origin_matrix": origin_matrix,
         "records": records,
         "duty": {
             "rate_type": duty.measure_type if duty else None,
