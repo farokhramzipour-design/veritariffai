@@ -193,6 +193,18 @@ def _normalize_origin_iso2(code: str) -> str:
     return c
 
 
+def _origin_member_countries(origin: Origin | None) -> list[str] | None:
+    if origin is None:
+        return None
+    if origin.is_erga_omnes or origin.origin_code == "1011":
+        return None
+    if origin.iso2 and len(origin.iso2) == 2:
+        return [origin.iso2]
+    if origin.member_iso2_codes and isinstance(origin.member_iso2_codes, list):
+        return [c for c in origin.member_iso2_codes if isinstance(c, str) and len(c) == 2]
+    return []
+
+
 def _origin_groups(origin: str) -> set[str]:
     iso2 = origin.upper().strip()
     groups = {iso2}
@@ -644,7 +656,7 @@ async def tariff_lookup(
         market=market,
         origin=origin_cc,
         destination_country=dest_cc,
-        limit=30,
+        limit=200 if full_report else 30,
     )
     tariff_quotas = [m for m in other_measures if isinstance(m, dict) and m.get("measure_type") == "TARIFF_QUOTA"]
     non_tariff_measures = [
@@ -922,6 +934,24 @@ async def tariff_lookup(
             reverse=True,
         )[:300]
 
+    measures_by_type: dict[str, list[dict]] = {}
+    certificate_codes_all: list[str] = []
+    for m in all_measures:
+        mt = m.measure_type if isinstance(m.measure_type, str) else "UNKNOWN"
+        measures_by_type.setdefault(mt, []).append(_measure_record(m, market=market, origin_map=origin_map))
+        if isinstance(m.measure_condition, dict):
+            conds = m.measure_condition.get("conditions")
+            if isinstance(conds, list):
+                for c in conds:
+                    if isinstance(c, dict):
+                        cc = c.get("certificate_code")
+                        if isinstance(cc, str) and cc:
+                            certificate_codes_all.append(cc)
+
+    certificate_codes_all = sorted({c for c in certificate_codes_all if isinstance(c, str) and c})
+    certificate_details = await _certificate_descriptions(db, certificate_codes_all)
+    measures_by_type = {k: v[:200] for k, v in measures_by_type.items()}
+
     origin_matrix: list[dict] = []
     if all_origin_codes:
         by_origin: dict[str, list[TariffMeasure]] = {}
@@ -962,6 +992,7 @@ async def tariff_lookup(
             "is_group": bool(origin_row.is_group) if origin_row else False,
             "group_category": origin_row.group_category if origin_row else None,
             "exists": origin_row is not None,
+            "member_countries": _origin_member_countries(origin_row),
         },
         "origin_resolution": origin_resolution,
         "rates_by_origin": rates_by_origin,
@@ -969,6 +1000,9 @@ async def tariff_lookup(
         "available_origin_codes": all_origin_codes,
         "origin_matrix": origin_matrix,
         "records": records,
+        "measures_by_type": measures_by_type,
+        "certificate_codes": certificate_codes_all,
+        "certificate_details": certificate_details,
         "duty": {
             "rate_type": duty.measure_type if duty else None,
             "duty_rate": (
@@ -1237,6 +1271,90 @@ async def tariff_certificates(db: AsyncSession = Depends(get_session)):
     res = await db.execute(select(CertificateCode).order_by(CertificateCode.code.asc()))
     rows = res.scalars().all()
     return ok([{"code": r.code, "description": r.description, "category": r.category} for r in rows])
+
+
+@router.get("/origins")
+async def tariff_origins(
+    q: str | None = Query(None),
+    code_type: str | None = Query(None),
+    is_group: bool | None = Query(None),
+    limit: int = Query(200, ge=1, le=2000),
+    db: AsyncSession = Depends(get_session),
+):
+    stmt = select(Origin)
+    if isinstance(q, str) and q.strip():
+        term = f"%{q.strip().upper()}%"
+        stmt = stmt.where(sa.or_(Origin.origin_code.ilike(term), Origin.origin_name.ilike(term)))
+    if isinstance(code_type, str) and code_type.strip():
+        stmt = stmt.where(Origin.origin_code_type == code_type.strip())
+    if isinstance(is_group, bool):
+        stmt = stmt.where(Origin.is_group.is_(is_group))
+    stmt = stmt.order_by(Origin.origin_code.asc()).limit(limit)
+    res = await db.execute(stmt)
+    rows = res.scalars().all()
+    return ok(
+        {
+            "count": len(rows),
+            "items": [
+                {
+                    "origin_code": r.origin_code,
+                    "origin_name": r.origin_name,
+                    "origin_code_type": r.origin_code_type,
+                    "iso2": r.iso2,
+                    "iso3": r.iso3,
+                    "is_erga_omnes": bool(r.is_erga_omnes),
+                    "is_group": bool(r.is_group),
+                    "group_category": r.group_category,
+                    "member_count": len(r.member_iso2_codes) if isinstance(r.member_iso2_codes, list) else None,
+                }
+                for r in rows
+            ],
+        }
+    )
+
+
+@router.get("/origins/{origin_code}")
+async def tariff_origin_detail(origin_code: str, db: AsyncSession = Depends(get_session)):
+    code = (origin_code or "").strip().upper()
+    res = await db.execute(select(Origin).where(Origin.origin_code == code).limit(1))
+    row = res.scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="origin_code not found")
+    return ok(
+        {
+            "origin_code": row.origin_code,
+            "origin_name": row.origin_name,
+            "origin_code_type": row.origin_code_type,
+            "iso2": row.iso2,
+            "iso3": row.iso3,
+            "is_eu_member": bool(row.is_eu_member),
+            "is_erga_omnes": bool(row.is_erga_omnes),
+            "is_group": bool(row.is_group),
+            "group_category": row.group_category,
+            "member_countries": _origin_member_countries(row),
+            "member_iso2_codes": row.member_iso2_codes,
+            "notes": row.notes,
+            "last_updated": row.last_updated.isoformat() if row.last_updated else None,
+        }
+    )
+
+
+@router.get("/origins/{origin_code}/countries")
+async def tariff_origin_countries(origin_code: str, db: AsyncSession = Depends(get_session)):
+    code = (origin_code or "").strip().upper()
+    res = await db.execute(select(Origin).where(Origin.origin_code == code).limit(1))
+    row = res.scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="origin_code not found")
+    return ok(
+        {
+            "origin_code": row.origin_code,
+            "origin_name": row.origin_name,
+            "is_erga_omnes": bool(row.is_erga_omnes),
+            "countries": _origin_member_countries(row),
+            "note": "null countries means 'all countries' (erga omnes)" if row.is_erga_omnes else None,
+        }
+    )
 
 
 @router.get("/conditions/{hs_code}")
