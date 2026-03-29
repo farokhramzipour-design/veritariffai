@@ -193,6 +193,56 @@ def _normalize_origin_iso2(code: str) -> str:
     return c
 
 
+_COUNTRY_NAME_MAP: dict[str, str] = {
+    "GB": "United Kingdom",
+    "DE": "Germany",
+    "TR": "Türkiye",
+    "RU": "Russian Federation",
+    "IN": "India",
+    "ID": "Indonesia",
+    "KR": "Korea, Republic of (South Korea)",
+    "UA": "Ukraine",
+    "KP": "North Korea",
+}
+
+
+def _country_name(iso2: str | None) -> str | None:
+    c = (iso2 or "").strip().upper()
+    if not c:
+        return None
+    return _COUNTRY_NAME_MAP.get(c, c)
+
+
+def _display_origin_name(code: str, origin: Origin | None) -> str:
+    c = (code or "").strip().upper()
+    if c == "1011":
+        return "ERGA OMNES"
+    if c == "1008":
+        return "All third countries"
+    if origin and origin.origin_name and origin.origin_name.strip() and origin.origin_name.strip() != origin.origin_code:
+        return origin.origin_name.strip()
+    if len(c) == 2 and c.isalpha():
+        return _country_name(c) or c
+    return origin.origin_name.strip() if origin and origin.origin_name else c
+
+
+def _merge_origin_resolution(base: list[str], extras: list[str]) -> list[str]:
+    base_norm = [(c or "").strip().upper() for c in base if c]
+    extras_norm = [(c or "").strip().upper() for c in extras if c]
+    tail = []
+    if "1011" in base_norm:
+        tail.append("1011")
+        base_norm = [c for c in base_norm if c != "1011"]
+    seen: set[str] = set()
+    out: list[str] = []
+    for c in base_norm + extras_norm + tail:
+        if not c or c in seen:
+            continue
+        seen.add(c)
+        out.append(c)
+    return out
+
+
 def _origin_member_countries(origin: Origin | None) -> list[str] | None:
     if origin is None:
         return None
@@ -342,11 +392,7 @@ def _rate_basis_for_measure(*, measure_type: str | None, origin_code: str | None
 def _measure_record(m: TariffMeasure, *, market: str, origin_map: dict[str, Origin]) -> dict:
     origin_code_val = _measure_origin_code(m)
     origin_row_val = origin_map.get(origin_code_val)
-    origin_name_val = (
-        origin_row_val.origin_name
-        if origin_row_val
-        else ("ERGA OMNES" if origin_code_val == "1011" else origin_code_val)
-    )
+    origin_name_val = _display_origin_name(origin_code_val, origin_row_val)
     raw = m.raw_json if isinstance(m.raw_json, dict) else {}
     duty_meta_entry = _measure_duty_meta(m)
     duty_expr = (
@@ -663,7 +709,7 @@ async def tariff_lookup(
             {
                 "origin_code": code,
                 "exists": row is not None,
-                "origin_name": row.origin_name if row else f"Unknown — code {code}",
+                "origin_name": _display_origin_name(code, row) if row else f"Unknown — code {code}",
                 "origin_code_type": row.origin_code_type if row else None,
                 "is_group": bool(row.is_group) if row else None,
                 "is_erga_omnes": bool(row.is_erga_omnes) if row else (code == "1011"),
@@ -706,6 +752,27 @@ async def tariff_lookup(
         all_origin_rows = res.scalars().all()
         for o in all_origin_rows:
             origin_map.setdefault(o.origin_code, o)
+
+    safeguard_codes = [c for c in all_origin_codes if re.match(r"^5\\d{3}$", c)]
+    if safeguard_codes:
+        resolved_origin_codes = _merge_origin_resolution(resolved_origin_codes, safeguard_codes)
+        res = await db.execute(select(Origin).where(Origin.origin_code.in_(resolved_origin_codes)))
+        origin_rows = res.scalars().all()
+        origin_map = {o.origin_code: o for o in origin_rows} | origin_map
+        origin_resolution = []
+        for code in resolved_origin_codes:
+            row = origin_map.get(code)
+            origin_resolution.append(
+                {
+                    "origin_code": code,
+                    "exists": row is not None,
+                    "origin_name": _display_origin_name(code, row) if row else f"Unknown — code {code}",
+                    "origin_code_type": row.origin_code_type if row else None,
+                    "is_group": bool(row.is_group) if row else None,
+                    "is_erga_omnes": bool(row.is_erga_omnes) if row else (code == "1011"),
+                    "group_category": row.group_category if row else None,
+                }
+            )
 
     res = await db.execute(select(HSCode.description).where(HSCode.code == hs).limit(1))
     description = res.scalar_one_or_none() or f"HS {hs}"
@@ -853,6 +920,7 @@ async def tariff_lookup(
     if duty_origin_code:
         res = await db.execute(select(Origin.origin_name).where(Origin.origin_code == duty_origin_code).limit(1))
         duty_origin_name = res.scalar_one_or_none()
+        duty_origin_name = _display_origin_name(duty_origin_code, origin_map.get(duty_origin_code))
 
     rate_basis = _rate_basis_for_measure(measure_type=duty.measure_type if duty else None, origin_code=duty_origin_code)
     has_mfn_via_walkup = bool(duty and duty_origin_code == "1011" and origin_cc != "1011")
@@ -904,7 +972,7 @@ async def tariff_lookup(
     for code in resolved_origin_codes:
         m = _best_for_origin(code)
         row = origin_map.get(code)
-        origin_name_val = row.origin_name if row else ("ERGA OMNES" if code == "1011" else f"Unknown — code {code}")
+        origin_name_val = _display_origin_name(code, row)
         origin_code_type_val = row.origin_code_type if row else None
         duty_meta_entry = _measure_duty_meta(m) if m else None
         human = duty_meta_entry.get("human_readable") if duty_meta_entry and isinstance(duty_meta_entry.get("human_readable"), str) else None
@@ -992,7 +1060,7 @@ async def tariff_lookup(
             by_origin.setdefault(oc, []).append(m)
         for oc in all_origin_codes:
             row = origin_map.get(oc)
-            name = row.origin_name if row else ("ERGA OMNES" if oc == "1011" else oc)
+            name = _display_origin_name(oc, row)
             code_type = row.origin_code_type if row else None
             origin_matrix.append(
                 {
@@ -1007,11 +1075,38 @@ async def tariff_lookup(
                 }
             )
 
-    stacked_measures = [
+    stacked_rows = [
+        m
+        for m in all_measures
+        if m.measure_type in ("SAFEGUARD", "ANTI_DUMPING", "COUNTERVAILING", "ADDITIONAL")
+        and _measure_origin_code(m) in resolved_origin_codes
+        and _measure_has_any_duty(m)
+    ]
+    stacked_measures = [_measure_record(m, market=market, origin_map=origin_map) for m in stacked_rows][:200]
+
+    stacked_rate_sum = 0.0
+    for m in stacked_rows:
+        if m.rate_ad_valorem is not None:
+            stacked_rate_sum += float(m.rate_ad_valorem)
+
+    if effective_duty_rate is None:
+        base_rate = None
+        if duty and duty.rate_ad_valorem is not None:
+            base_rate = float(duty.rate_ad_valorem)
+        elif duty and is_nihil:
+            base_rate = 0.0
+        if base_rate is not None or stacked_rate_sum > 0:
+            effective_duty_rate = float(base_rate or 0.0) + float(stacked_rate_sum)
+            if effective_duty_unit is None:
+                effective_duty_unit = "%"
+
+    tariff_quotas_effective = [
         _measure_record(m, market=market, origin_map=origin_map)
         for m in all_measures
-        if m.measure_type in ("SAFEGUARD", "ANTI_DUMPING", "COUNTERVAILING", "IMPORT_CONTROL")
+        if m.measure_type == "TARIFF_QUOTA" and _measure_origin_code(m) in resolved_origin_codes
     ][:200]
+    if tariff_quotas_effective:
+        tariff_quotas = tariff_quotas_effective
 
     mfn_duty = None
     if has_mfn_via_walkup and duty:
@@ -1030,7 +1125,7 @@ async def tariff_lookup(
         "destination_market": market,
         "origin": {
             "origin_code": origin_cc,
-            "origin_name": origin_row.origin_name if origin_row else None,
+            "origin_name": _display_origin_name(origin_cc, origin_row) if origin_row else None,
             "origin_code_type": origin_row.origin_code_type if origin_row else "country",
             "iso2": origin_row.iso2 if origin_row else origin_cc,
             "iso3": origin_row.iso3 if origin_row else None,
