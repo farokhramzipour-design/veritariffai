@@ -229,9 +229,11 @@ async def _resolve_origin_codes_for_country(db: AsyncSession, iso2: str) -> list
             Origin.member_iso2_codes.is_not(None),
             Origin.member_iso2_codes.contains([cc]),
         )
+        .order_by(Origin.origin_code.asc())
     )
     codes.extend([c for c in res.scalars().all() if isinstance(c, str)])
 
+    codes.append("1008")
     codes.append("1011")
     seen: set[str] = set()
     out: list[str] = []
@@ -405,40 +407,48 @@ async def _pick_best_duty(
         code = (m.country_of_origin or "1011").strip().upper()
         return code in resolved_codes
 
-    preferential = [
-        m for m in measures
-        if m.measure_type == "PREFERENTIAL" and matches_origin(m) and _measure_has_any_duty(m)
-    ]
-    if preferential:
-        pref_av = [m for m in preferential if m.rate_ad_valorem is not None]
-        if pref_av:
-            return sorted(
-                pref_av,
-                key=lambda m: (_origin_specificity(m.country_of_origin), m.rate_ad_valorem, m.ingested_at),
-                reverse=False,
-            )[0]
-        return sorted(preferential, key=lambda m: (_origin_specificity(m.country_of_origin), m.ingested_at), reverse=False)[0]
-
-    additional = [
-        m for m in measures
-        if m.measure_type in ("ANTI_DUMPING", "COUNTERVAILING", "ADDITIONAL") and matches_origin(m)
+    duty_rows = [
+        m
+        for m in measures
+        if m.measure_type in ("PREFERENTIAL", "MFN", "SUSPENSION", "END_USE")
+        and matches_origin(m)
         and _measure_has_any_duty(m)
     ]
-    if additional:
-        add_av = [m for m in additional if m.rate_ad_valorem is not None]
-        if add_av:
-            return sorted(add_av, key=lambda m: (m.rate_ad_valorem, m.ingested_at), reverse=True)[0]
-        return sorted(additional, key=lambda m: m.ingested_at, reverse=True)[0]
 
-    mfn = [
-        m for m in measures
-        if m.measure_type == "MFN"
-        and ((m.country_of_origin or "1011").strip().upper() == "1011")
-        and _measure_has_any_duty(m)
-    ]
-    if mfn:
-        return sorted(mfn, key=lambda m: m.ingested_at, reverse=True)[0]
-    return None
+    def _type_rank(mt: str) -> int:
+        if mt == "PREFERENTIAL":
+            return 0
+        if mt == "MFN":
+            return 1
+        return 2
+
+    def _rate_or_big(m: TariffMeasure) -> float:
+        r = _measure_duty_rate_pct(m)
+        return float(r) if r is not None else 9999.0
+
+    if duty_rows:
+        duty_rows.sort(
+            key=lambda m: (
+                _origin_specificity(m.country_of_origin),
+                _type_rank(m.measure_type),
+                _rate_or_big(m),
+                m.ingested_at,
+            )
+        )
+        return duty_rows[0]
+
+    res = await db.execute(
+        select(TariffMeasure)
+        .where(
+            TariffMeasure.hs_code.in_(candidates),
+            TariffMeasure.jurisdiction == market,
+            TariffMeasure.measure_type == "MFN",
+            sa.func.coalesce(TariffMeasure.country_of_origin, "1011") == "1011",
+        )
+        .order_by(sa.func.length(TariffMeasure.hs_code).desc(), TariffMeasure.ingested_at.desc())
+        .limit(1)
+    )
+    return res.scalar_one_or_none()
 
 
 async def _other_measures(
@@ -566,9 +576,17 @@ async def _certificate_descriptions(db: AsyncSession, codes: list[str]) -> dict[
     res = await db.execute(select(CertificateCode).where(CertificateCode.code.in_(uniq)))
     rows = res.scalars().all()
     m = {r.code: r.description for r in rows}
-    for c in uniq:
-        if c not in m:
-            m[c] = f"Unknown — code {c}"
+    missing = [c for c in uniq if c not in m]
+    if missing:
+        stmt = (
+            sa.dialects.postgresql.insert(CertificateCode)
+            .values([{"code": c, "description": f"Certificate {c} — description pending", "category": "unknown"} for c in missing])
+            .on_conflict_do_nothing(index_elements=[CertificateCode.code])
+        )
+        await db.execute(stmt)
+        await db.commit()
+        for c in missing:
+            m[c] = f"Certificate {c} — description pending"
     return m
 
 
@@ -623,6 +641,7 @@ async def tariff_lookup(
         raise HTTPException(status_code=422, detail="destination must be an EU country or GB/UK")
 
     await ensure_origin(db, origin_code=origin_cc, origin_name=origin_cc)
+    await ensure_origin(db, origin_code="1008", origin_name="All third countries")
     await ensure_origin(db, origin_code="1011", origin_name="ERGA OMNES")
     await db.commit()
 
@@ -832,6 +851,15 @@ async def tariff_lookup(
         duty_origin_name = res.scalar_one_or_none()
 
     rate_basis = _rate_basis_for_measure(measure_type=duty.measure_type if duty else None, origin_code=duty_origin_code)
+    has_mfn_via_walkup = bool(duty and duty_origin_code == "1011" and origin_cc != "1011")
+    if has_mfn_via_walkup:
+        warnings.append(
+            f"{origin_cc} has no more specific EU duty measure for this HS code. The ERGA OMNES (MFN) rate applies."
+        )
+        if origin_cc == "GB" and market == "EU":
+            warnings.append(
+                "The UK is a third country to the EU. Standard third-country (MFN) duty applies unless a specific preferential measure exists for this HS code."
+            )
 
     measures_for_origin = [
         m
@@ -975,6 +1003,20 @@ async def tariff_lookup(
                 }
             )
 
+    stacked_measures = [
+        _measure_record(m, market=market, origin_map=origin_map)
+        for m in all_measures
+        if m.measure_type in ("SAFEGUARD", "ANTI_DUMPING", "COUNTERVAILING", "IMPORT_CONTROL")
+    ][:200]
+
+    mfn_duty = None
+    if has_mfn_via_walkup and duty:
+        duty_meta_walk = _measure_duty_meta(duty)
+        if duty_meta_walk and isinstance(duty_meta_walk.get("raw_expression"), str):
+            mfn_duty = duty_meta_walk.get("raw_expression")
+        elif duty.rate_ad_valorem is not None:
+            mfn_duty = f"{float(duty.rate_ad_valorem):.3f} %"
+
     payload = {
         "hs_code": hs,
         "description": description,
@@ -1003,6 +1045,7 @@ async def tariff_lookup(
         "measures_by_type": measures_by_type,
         "certificate_codes": certificate_codes_all,
         "certificate_details": certificate_details,
+        "stacked_measures": stacked_measures,
         "duty": {
             "rate_type": duty.measure_type if duty else None,
             "duty_rate": (
@@ -1056,6 +1099,8 @@ async def tariff_lookup(
             "entry_price_component": has_entry_price,
             "vat_applies_to": "goods_value + duty",
             "note": "VAT is assessed on CIF value + customs duty",
+            "has_mfn_via_walkup": has_mfn_via_walkup,
+            "mfn_duty": mfn_duty,
             "warnings": warnings,
         },
         "data_freshness": {

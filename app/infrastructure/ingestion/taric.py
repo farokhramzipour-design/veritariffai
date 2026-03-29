@@ -23,14 +23,46 @@ from app.infrastructure.database.session import AsyncSessionMaker
 
 _TARIC_URL = "https://ec.europa.eu/taxation_customs/dds2/taric/xml/taric_download.jsp"
 
-_MEASURE_TYPE_MAP: dict[str, str] = {
-    "103": "MFN",
-    "142": "PREFERENTIAL",
-    "551": "ANTI_DUMPING",
-    "552": "COUNTERVAILING",
-    "112": "SUSPENSION",
-    "115": "END_USE",
+_MFN_MEASURE_TYPE_IDS: set[str] = {
+    "103",
+    "105",
+    "106",
+    "112",
+    "115",
+    "117",
+    "119",
+    "142",
+    "143",
+    "145",
 }
+
+_PREFERENTIAL_MEASURE_TYPE_IDS: set[str] = {"142", "143", "145"}
+
+_ANTI_DUMPING_MEASURE_TYPE_IDS: set[str] = {"551", "552", "553", "554"}
+_COUNTERVAILING_MEASURE_TYPE_IDS: set[str] = {"555", "556"}
+
+_SAFEGUARD_MEASURE_TYPE_IDS: set[str] = {"696"}
+_IMPORT_CONTROL_MEASURE_TYPE_IDS: set[str] = {"763", "745", "277"}
+
+
+def _route_measure(*, measure_type_id: str, measure_type_description: str | None, has_quota_order_number: bool) -> str | None:
+    mt = (measure_type_id or "").strip()
+    desc = (measure_type_description or "").strip().lower()
+    if has_quota_order_number or ("quota" in desc):
+        return "TARIFF_QUOTA"
+    if mt in _SAFEGUARD_MEASURE_TYPE_IDS or "safeguard" in desc:
+        return "SAFEGUARD"
+    if mt in _IMPORT_CONTROL_MEASURE_TYPE_IDS or "import control" in desc or "prohibition" in desc or "restriction" in desc:
+        return "IMPORT_CONTROL"
+    if mt in _ANTI_DUMPING_MEASURE_TYPE_IDS or "anti-dumping" in desc or "anti dumping" in desc:
+        return "ANTI_DUMPING"
+    if mt in _COUNTERVAILING_MEASURE_TYPE_IDS or "countervailing" in desc:
+        return "COUNTERVAILING"
+    if mt in _PREFERENTIAL_MEASURE_TYPE_IDS or "preference" in desc or "gsp" in desc:
+        return "PREFERENTIAL"
+    if mt in _MFN_MEASURE_TYPE_IDS or "third country duty" in desc or "mfn" in desc:
+        return "MFN"
+    return None
 
 
 def _local(tag: str) -> str:
@@ -195,7 +227,7 @@ async def _upsert_measure(db: AsyncSession, *, row: dict[str, Any]) -> None:
             agricultural_component=None,
             quota_id=None,
             suspension=row.get("suspension", False),
-            measure_condition=None,
+            measure_condition=row.get("measure_condition"),
             raw_json=row.get("raw_json"),
             valid_from=row["valid_from"],
             valid_to=row.get("valid_to"),
@@ -215,6 +247,7 @@ async def _upsert_measure(db: AsyncSession, *, row: dict[str, Any]) -> None:
                 "rate_specific_amount": row.get("rate_specific_amount"),
                 "rate_specific_unit": row.get("rate_specific_unit"),
                 "suspension": row.get("suspension", False),
+                "measure_condition": row.get("measure_condition"),
                 "raw_json": row.get("raw_json"),
                 "valid_from": row["valid_from"],
                 "valid_to": row.get("valid_to"),
@@ -250,16 +283,102 @@ def _parse_goods_nomenclature(xml_path: str) -> dict[str, str]:
 def _extract_amount_fields(elem) -> tuple[Decimal | None, Decimal | None, str | None]:
     amount_str = _first_text(elem, ("MEASURE.CONDITION.DUTY.AMOUNT", "DUTY.AMOUNT", "MEASURE.COMPONENT.DUTY.AMOUNT"))
     expr_id = _first_text(elem, ("DUTY.EXPRESSION.ID", "MEASURE.CONDITION.DUTY.EXPRESSION.ID"))
-    unit = _first_text(elem, ("MONETARY.UNIT.CODE", "MEASUREMENT.UNIT.CODE", "MEASURE.CONDITION.MONETARY.UNIT.CODE"))
+    monetary = _first_text(elem, ("MONETARY.UNIT.CODE", "MEASURE.CONDITION.MONETARY.UNIT.CODE"))
+    measurement = _first_text(elem, ("MEASUREMENT.UNIT.CODE", "MEASURE.CONDITION.MEASUREMENT.UNIT.CODE"))
     if not amount_str:
         return None, None, None
     try:
         amount = Decimal(amount_str)
     except Exception:
         return None, None, None
-    if expr_id == "01" or unit is None:
+    if expr_id == "01":
         return amount, None, None
+    unit = None
+    if monetary and measurement:
+        unit = f"{monetary}/{measurement}"
+    elif measurement:
+        unit = measurement
+    elif monetary:
+        unit = monetary
     return None, amount, unit
+
+
+def _parse_components(elem) -> list[dict[str, Any]]:
+    components: list[dict[str, Any]] = []
+    for child in elem.iter():
+        if _local(child.tag) != "MEASURE.COMPONENT":
+            continue
+        ad, specific, unit = _extract_amount_fields(child)
+        expr_id = _first_text(child, ("DUTY.EXPRESSION.ID",))
+        monetary = _first_text(child, ("MONETARY.UNIT.CODE",))
+        measurement = _first_text(child, ("MEASUREMENT.UNIT.CODE",))
+        amount = ad if ad is not None else specific
+        if amount is None and not unit and not expr_id:
+            continue
+        components.append(
+            {
+                "duty_expression_id": expr_id,
+                "amount": str(amount) if amount is not None else None,
+                "monetary_unit": monetary,
+                "measurement_unit": measurement,
+                "unit": unit,
+            }
+        )
+    return components
+
+
+def _assemble_raw_expression(*, rate_ad_valorem: Decimal | None, rate_specific_amount: Decimal | None, rate_specific_unit: str | None, components: list[dict[str, Any]]) -> str | None:
+    parts: list[str] = []
+    if rate_ad_valorem is not None:
+        parts.append(f"{rate_ad_valorem} %")
+    if rate_specific_amount is not None:
+        if rate_specific_unit:
+            parts.append(f"{rate_specific_amount} {rate_specific_unit}")
+        else:
+            parts.append(f"{rate_specific_amount}")
+    if not parts and components:
+        for c in components:
+            a = c.get("amount")
+            u = c.get("unit")
+            if a and u:
+                parts.append(f"{a} {u}")
+            elif a:
+                parts.append(str(a))
+    if not parts:
+        return None
+    return " + ".join(parts)
+
+
+def _parse_measure_conditions(elem) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for child in elem.iter():
+        if _local(child.tag) != "MEASURE.CONDITION":
+            continue
+        condition_code = _first_text(child, ("CONDITION.CODE", "MEASURE.CONDITION.CODE"))
+        action_code = _first_text(child, ("CONDITION.ACTION.CODE", "MEASURE.CONDITION.ACTION.CODE"))
+        cert_type = _first_text(child, ("CERTIFICATE.TYPE.CODE",))
+        cert_code = _first_text(child, ("CERTIFICATE.CODE",))
+        cert_full = None
+        if cert_type and cert_code:
+            cert_full = f"{cert_type.strip().upper()}-{cert_code.strip()}"
+        duty_amount = _first_text(child, ("MEASURE.CONDITION.DUTY.AMOUNT",))
+        duty_expr_id = _first_text(child, ("MEASURE.CONDITION.DUTY.EXPRESSION.ID",))
+        measurement_unit = _first_text(child, ("MEASURE.CONDITION.MEASUREMENT.UNIT.CODE",))
+        monetary_unit = _first_text(child, ("MEASURE.CONDITION.MONETARY.UNIT.CODE",))
+        out.append(
+            {
+                "condition_code": condition_code,
+                "action_code": action_code,
+                "certificate_code": cert_full,
+                "certificate_type": cert_type,
+                "certificate_id": cert_code,
+                "duty_amount": duty_amount,
+                "duty_expression_id": duty_expr_id,
+                "measurement_unit": measurement_unit,
+                "monetary_unit": monetary_unit,
+            }
+        )
+    return [c for c in out if any(v for v in c.values())]
 
 
 def _parse_measures(xml_path: str, leaf_codes: set[str]) -> list[dict[str, Any]]:
@@ -273,7 +392,14 @@ def _parse_measures(xml_path: str, leaf_codes: set[str]) -> list[dict[str, Any]]
             continue
         sid = _first_text(elem, ("MEASURE.SID",)) or f"TARIC:{hs}:{uuid4()}"
         mt_id = _first_text(elem, ("MEASURE.TYPE.ID",))
-        if not mt_id or mt_id not in _MEASURE_TYPE_MAP:
+        if not mt_id:
+            elem.clear()
+            continue
+        mt_desc = _first_text(elem, ("MEASURE.TYPE.DESCRIPTION",))
+        quota_order_number = _first_text(elem, ("ORDER.NUMBER.ID", "MEASURE.ORDER.NUMBER.ID", "QUOTA.ORDER.NUMBER.ID"))
+        has_quota = bool(quota_order_number)
+        measure_type = _route_measure(measure_type_id=mt_id, measure_type_description=mt_desc, has_quota_order_number=has_quota)
+        if not measure_type:
             elem.clear()
             continue
         geo = _first_text(elem, ("GEOGRAPHICAL.AREA.ID",))
@@ -281,8 +407,20 @@ def _parse_measures(xml_path: str, leaf_codes: set[str]) -> list[dict[str, Any]]
         valid_from = _parse_date(_first_text(elem, ("VALIDITY.START.DATE",))) or date.today()
         valid_to = _parse_date(_first_text(elem, ("VALIDITY.END.DATE",)))
 
+        components = _parse_components(elem)
         rate_ad, rate_specific, unit = _extract_amount_fields(elem)
-        measure_type = _MEASURE_TYPE_MAP[mt_id]
+        raw_expression = _assemble_raw_expression(rate_ad_valorem=rate_ad, rate_specific_amount=rate_specific, rate_specific_unit=unit, components=components)
+        conditions = _parse_measure_conditions(elem)
+        duty_meta: dict[str, Any] = {
+            "raw_expression": raw_expression,
+            "components": components,
+            "is_nihil": False,
+        }
+        if raw_expression and raw_expression.strip() in {"0", "0.0", "0.00", "0.000", "0.000 %", "0 %"}:
+            duty_meta["is_nihil"] = True
+        if not raw_expression and not rate_ad and not rate_specific and measure_type in {"TARIFF_QUOTA"}:
+            duty_meta["is_nihil"] = True
+
         suspension = measure_type in {"SUSPENSION", "END_USE"}
         rows.append(
             {
@@ -293,13 +431,16 @@ def _parse_measures(xml_path: str, leaf_codes: set[str]) -> list[dict[str, Any]]
                 "rate_specific_amount": rate_specific,
                 "rate_specific_unit": unit,
                 "suspension": suspension,
+                "measure_condition": {"duty": duty_meta, "conditions": conditions} if (duty_meta or conditions) else None,
                 "valid_from": valid_from,
                 "valid_to": valid_to,
                 "source_measure_id": str(sid),
                 "raw_json": {
                     "measure_sid": str(sid),
                     "measure_type_id": mt_id,
+                    "measure_type_description": mt_desc,
                     "geographical_area_id": geo,
+                    "quota_order_number": quota_order_number,
                     "duty_expression_id": _first_text(elem, ("DUTY.EXPRESSION.ID", "MEASURE.CONDITION.DUTY.EXPRESSION.ID")),
                 },
             }
@@ -344,11 +485,59 @@ async def _run_taric_ingest(*, mode: str, delta_date: date | None) -> dict[str, 
                     await _upsert_measure(db, row=row)
                 await db.commit()
 
+            res = await db.execute(
+                sa.text(
+                    """
+                    SELECT COUNT(*) FROM (
+                      SELECT DISTINCT tm.hs_code
+                      FROM tariff.tariff_measures tm
+                      WHERE tm.jurisdiction = 'EU'
+                        AND NOT EXISTS (
+                          SELECT 1
+                          FROM tariff.tariff_measures mfn
+                          WHERE mfn.jurisdiction = 'EU'
+                            AND mfn.hs_code = tm.hs_code
+                            AND mfn.measure_type = 'MFN'
+                            AND COALESCE(mfn.country_of_origin, '1011') = '1011'
+                        )
+                    ) t
+                    """
+                )
+            )
+            mfn_missing_count = int(res.scalar_one() or 0)
+            sample_res = await db.execute(
+                sa.text(
+                    """
+                    SELECT DISTINCT tm.hs_code
+                    FROM tariff.tariff_measures tm
+                    WHERE tm.jurisdiction = 'EU'
+                      AND NOT EXISTS (
+                        SELECT 1
+                        FROM tariff.tariff_measures mfn
+                        WHERE mfn.jurisdiction = 'EU'
+                          AND mfn.hs_code = tm.hs_code
+                          AND mfn.measure_type = 'MFN'
+                          AND COALESCE(mfn.country_of_origin, '1011') = '1011'
+                      )
+                    ORDER BY tm.hs_code
+                    LIMIT 25
+                    """
+                )
+            )
+            missing_mfn_sample = [c for c in sample_res.scalars().all() if isinstance(c, str)]
+
             run.status = "success"
             run.records_processed = len(measures)
             run.completed_at = datetime.utcnow()
             await db.commit()
-            return {"source": "TARIC", "status": run.status, "records_processed": len(measures), "hs_codes": len(leaf_codes)}
+            return {
+                "source": "TARIC",
+                "status": run.status,
+                "records_processed": len(measures),
+                "hs_codes": len(leaf_codes),
+                "mfn_missing_count": mfn_missing_count,
+                "mfn_missing_sample": missing_mfn_sample,
+            }
         except Exception as exc:
             await db.rollback()
             run.status = "failed"
