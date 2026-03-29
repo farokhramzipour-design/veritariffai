@@ -72,6 +72,15 @@ async def get_current_user(
         user_id = await _resolve_db_uuid(db, google_sub=sub, email=email)
         if not user_id:
             raise APIError(401, "UNAUTHENTICATED", "User not found. Please log in again.")
+    else:
+        # JWT has a UUID-shaped user_id — verify it actually exists in the DB.
+        # If not (e.g. deleted user, cross-env token), fall back to sub/email resolution.
+        from app.infrastructure.database.models import User
+        row = await db.execute(select(User).where(User.id == UUID(user_id)))
+        if not row.scalar_one_or_none():
+            user_id = await _resolve_db_uuid(db, google_sub=sub, email=email)
+            if not user_id:
+                raise APIError(401, "UNAUTHENTICATED", "User not found. Please log in again.")
 
     blocked = False
     if redis:
