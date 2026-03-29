@@ -17,6 +17,17 @@ from pydantic import BaseModel, Field, field_validator
 class ImportAnalysisRequest(BaseModel):
     """Body accepted by POST /api/v1/import-analysis."""
 
+    profile_name: str = Field(
+        ...,
+        min_length=1,
+        max_length=255,
+        description="Name for the saved analysis profile.",
+        examples=["Q1 Cotton Trousers Import"],
+    )
+    profile_description: Optional[str] = Field(
+        None,
+        description="Optional description for the saved profile.",
+    )
     product_description: str = Field(
         ...,
         min_length=3,
@@ -184,6 +195,7 @@ class ImportAnalysisResponse(BaseModel):
     """Full API response envelope."""
 
     success: bool
+    profile_id: Optional[str] = Field(None, description="ID of the saved analysis profile.")
     input: ImportAnalysisRequest
     classification: HSClassificationResult
     rates: RatesResult
