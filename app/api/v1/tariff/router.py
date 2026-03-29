@@ -608,6 +608,20 @@ async def tariff_lookup(
         if isinstance(m, dict) and m.get("measure_type") in ("SAFEGUARD", "IMPORT_CONTROL")
     ]
 
+    today = date.today()
+    candidates = _hs_candidates(hs)
+    res = await db.execute(
+        select(TariffMeasure)
+        .where(
+            TariffMeasure.hs_code.in_(candidates),
+            TariffMeasure.jurisdiction == market,
+            TariffMeasure.valid_from <= today,
+            sa.or_(TariffMeasure.valid_to.is_(None), TariffMeasure.valid_to >= today),
+        )
+        .order_by(sa.func.length(TariffMeasure.hs_code).desc(), TariffMeasure.ingested_at.desc())
+    )
+    all_measures = res.scalars().all()
+
     res = await db.execute(select(HSCode.description).where(HSCode.code == hs).limit(1))
     description = res.scalar_one_or_none() or f"HS {hs}"
     res = await db.execute(
@@ -757,19 +771,6 @@ async def tariff_lookup(
 
     rate_basis = _rate_basis_for_measure(measure_type=duty.measure_type if duty else None, origin_code=duty_origin_code)
 
-    today = date.today()
-    candidates = _hs_candidates(hs)
-    res = await db.execute(
-        select(TariffMeasure)
-        .where(
-            TariffMeasure.hs_code.in_(candidates),
-            TariffMeasure.jurisdiction == market,
-            TariffMeasure.valid_from <= today,
-            sa.or_(TariffMeasure.valid_to.is_(None), TariffMeasure.valid_to >= today),
-        )
-        .order_by(sa.func.length(TariffMeasure.hs_code).desc(), TariffMeasure.ingested_at.desc())
-    )
-    all_measures = res.scalars().all()
     measures_for_origin = [
         m
         for m in all_measures
